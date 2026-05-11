@@ -36,6 +36,7 @@ def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpo
         "사용자가 제공한 텍스트의 내용을 단 한 글자도 누락하거나 요약하지 마십시오. "
         "특히 입력 데이터에 이미 표(Table) 형태의 마크다운(|---|---|)이 포함되어 있다면 그 구조와 데이터를 절대 변경하지 마십시오. "
         "본문 외의 인사말이나 부연 설명은 절대 출력하지 마십시오."
+        "문서 맨 위에 '```markdown'을 표시하지 마십시오"
     )
     
     paragraphs = raw_text.split('\n\n')
@@ -80,51 +81,131 @@ def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpo
             logger.error(f"Ollama 오류 (Chunk {idx+1}/{len(chunks)}): {str(e)}")
             yield f"\n\n**[오류: 일부 구간 변환 실패]**\n\n"
 
-def check_page_exists(wiki_url: str, api_token: str, target_path: str) -> Tuple[bool, Optional[int]]:
+def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: str = "ko") -> Tuple[bool, Optional[int]]:
+    """path로 페이지 존재 여부를 단건 조회한다. O(1).
+
+    기존엔 pages.list로 전체 페이지를 받아 path를 매칭하는 O(N) 방식이라
+    문서 수가 늘면 응답 크기와 지연이 함께 커졌다. singleByPath로 변경.
+
+    Wiki.js v2의 singleByPath는 페이지가 없으면 GraphQL 에러를 반환하므로,
+    'PageNotFound' 등 일반 에러는 (False, None)으로 처리하되,
+    권한/인증 관련 에러는 명시적으로 raise하여 환경 문제를 빨리 드러낸다.
+    """
     wiki_url = _fix_graphql_url(wiki_url)
-    graphql_query = "query { pages { list { id path } } }"
+    query = """
+    query ($path: String!, $locale: String!) {
+      pages {
+        singleByPath(path: $path, locale: $locale) {
+          id
+        }
+      }
+    }
+    """
+    variables = {"path": target_path, "locale": locale}
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    
     try:
-        response = requests.post(wiki_url, headers=headers, json={"query": graphql_query}, timeout=30)
+        response = requests.post(
+            wiki_url, headers=headers,
+            json={"query": query, "variables": variables},
+            timeout=30
+        )
         response.raise_for_status()
-        pages = response.json().get("data", {}).get("pages", {}).get("list", [])
-        for page in pages:
-            if page.get("path") == target_path:
-                return True, int(page["id"])
+        data = response.json()
+        
+        # GraphQL 에러 분기
+        if data.get("errors"):
+            for err in data["errors"]:
+                msg = (err.get("message") or "").lower()
+                if "forbidden" in msg or "unauthorized" in msg or "permission" in msg:
+                    raise WikiBuilderError(f"권한 부족: {err.get('message')}")
+            # 권한 외 에러 (보통 PageNotFound) → 페이지 없음으로 간주
+            logger.debug(f"singleByPath 에러를 페이지 없음으로 처리: {data['errors']}")
+            return False, None
+        
+        page = data.get("data", {}).get("pages", {}).get("singleByPath")
+        if page and page.get("id"):
+            return True, int(page["id"])
         return False, None
+    except WikiBuilderError:
+        raise
     except Exception as e:
         raise WikiBuilderError(f"조회 실패: {str(e)}")
+
+def fetch_page_tags(wiki_url: str, api_token: str, page_id: int) -> list:
+    """페이지의 기존 태그 목록을 가져옵니다. 업데이트 시 태그 보존용.
+    
+    Note: pages.single은 tags를 [Tag] 객체 배열로 반환하므로 tag 필드를 꺼내야 함.
+    (pages.list는 [String] 문자열 배열 - 다름)
+    """
+    wiki_url = _fix_graphql_url(wiki_url)
+    query = """
+    query ($id: Int!) {
+      pages {
+        single(id: $id) {
+          tags { tag }
+        }
+      }
+    }
+    """
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    try:
+        response = requests.post(wiki_url, headers=headers, 
+                                 json={"query": query, "variables": {"id": page_id}}, 
+                                 timeout=30)
+        response.raise_for_status()
+        tags_data = response.json().get("data", {}).get("pages", {}).get("single", {}).get("tags", [])
+        return [t["tag"] for t in tags_data if t.get("tag")]
+    except Exception as e:
+        logger.warning(f"태그 조회 실패 (page_id={page_id}): {e}")
+        return []
 
 def create_wikijs_page(wiki_url: str, api_token: str, title: str, content: str, path: str) -> int:
     wiki_url = _fix_graphql_url(wiki_url)
     query = """
-    mutation CreatePage($content: String!, $path: String!, $title: String!) {
+    mutation CreatePage($content: String!, $path: String!, $title: String!, $tags: [String]!) {
       pages {
         create(content: $content, description: "AI 자동 생성", editor: "markdown", isPublished: true, 
-               isPrivate: false, locale: "ko", path: $path, tags: ["auto"], title: $title) {
+               isPrivate: false, locale: "ko", path: $path, tags: $tags, title: $title) {
           responseResult { succeeded message }
           page { id }
         }
       }
     }
     """
-    variables = {"content": content, "path": path, "title": title}
+    variables = {
+        "content": content, 
+        "path": path, 
+        "title": title,
+        "tags": ["auto", "pdf"]  # 'pdf' 태그로 indexer가 스킵 판단
+    }
     return _execute_mutation(wiki_url, api_token, query, variables, "create")
 
 def update_wikijs_page(wiki_url: str, api_token: str, page_id: int, title: str, content: str, path: str) -> int:
     wiki_url = _fix_graphql_url(wiki_url)
+    
+    # 기존 태그 보존 + 'pdf' 태그 보장 (사용자가 수동으로 추가한 태그도 유지)
+    existing_tags = fetch_page_tags(wiki_url, api_token, page_id)
+    merged_tags = list(set(existing_tags + ["pdf", "updated"]))
+    
     query = """
-    mutation UpdatePage($id: Int!, $content: String!, $path: String!, $title: String!) {
+    mutation UpdatePage($id: Int!, $content: String!, $path: String!, $title: String!, $tags: [String]!) {
       pages {
         update(id: $id, content: $content, description: "AI 자동 업데이트", editor: "markdown", 
-               isPublished: true, isPrivate: false, locale: "ko", path: $path, tags: ["updated"], title: $title) {
+               isPublished: true, isPrivate: false, locale: "ko", path: $path, tags: $tags, title: $title) {
           responseResult { succeeded message }
           page { id }
         }
       }
     }
     """
-    variables = {"id": page_id, "content": content, "path": path, "title": title}
+    variables = {
+        "id": page_id, 
+        "content": content, 
+        "path": path, 
+        "title": title, 
+        "tags": merged_tags
+    }
     return _execute_mutation(wiki_url, api_token, query, variables, "update")
 
 def _execute_mutation(endpoint, api_token, query, variables, m_type) -> int:
