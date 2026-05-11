@@ -4,11 +4,15 @@ import requests
 import json
 import time
 import re
+import logging
 from chromadb.utils import embedding_functions
 from io import BytesIO
 
 # 코어 모듈 임포트
 import wiki_builder
+from chunker import chunk_text
+
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
@@ -23,7 +27,7 @@ def reset_generation_state():
         del st.session_state.uploaded_file_buffer
 
 # ==========================================
-# 설정 값 (외부 API 흔적 완벽 제거 및 사내망 통일)
+# 설정 값 (st.secrets에서 로드)
 # ==========================================
 CHROMA_PATH = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
@@ -79,7 +83,7 @@ def call_llm(messages, context):
     }
     
     try:
-        # 내장 그래픽 환경에서의 7B 연산 지연을 고려해 타임아웃을 300초로 상향
+        # 내장 그래픽 환경에서의 7B 연산 지연을 고려해 타임아웃 상향
         res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=120)
         if res.status_code == 200:
             return res.json().get("message", {}).get("content", "응답 내용이 비어있습니다.")
@@ -102,11 +106,21 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     return similar
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    try: collection.delete(where={"page_id": page_id})
-    except: pass
-    chunks = [content[i:i+500] for i in range(0, len(content), 50)]
-    if not chunks: return 0
-    ids = [f"page_{page_id}_{i}" for i in range(len(chunks))]
+    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
+
+    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
+    """
+    # 기존 청크 삭제 (없거나 실패해도 진행 가능)
+    try:
+        collection.delete(where={"page_id": page_id})
+    except Exception as e:
+        logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}")
+
+    chunks = chunk_text(content)
+    if not chunks:
+        return 0
+
+    ids = [f"page_{page_id}_chunk_{i}" for i in range(len(chunks))]
     metas = [{"page_id": page_id, "title": title, "path": path} for _ in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
@@ -129,8 +143,11 @@ def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=
 # 메인 UI
 # ==========================================
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
-try: collection = load_vectordb()
-except Exception as e: st.error(f"DB 로드 실패: {e}"); st.stop()
+try:
+    collection = load_vectordb()
+except Exception as e:
+    st.error(f"DB 로드 실패: {e}")
+    st.stop()
 
 app_mode = st.sidebar.radio(
     "모드 선택", 
@@ -151,7 +168,7 @@ if app_mode == "Search AI":
         with st.chat_message("assistant"):
             res = collection.query(query_texts=[prompt], n_results=3)
             
-            # [방어적 프로그래밍 추가] None 값이 섞여 들어오면 안전하게 무시합니다.
+            # [방어적 프로그래밍] None 값이 섞여 들어오면 안전하게 무시합니다.
             if not res['documents'] or not res['documents'][0]:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
@@ -215,7 +232,7 @@ elif app_mode == "PDF -> Wiki Data":
             
             with st.spinner("RAG 엔진 동기화 중..."):
                 cnt = update_vector_db(collection, page_id, config['title'], config['path'], refined_md)
-                st.success(f"✅ 인덱싱 완료")
+                st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
 
             st.button("새로운 작업 시작", on_click=reset_generation_state, type="primary")
 

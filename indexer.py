@@ -8,32 +8,42 @@ from markdown import markdown
 from bs4 import BeautifulSoup
 from chromadb.utils import embedding_functions
 
-# secrets 로드
+from chunker import chunk_text
+
+# ==========================================
+# 설정 로드 (secrets.toml)
+# ==========================================
 _secrets_path = Path(__file__).parent / ".streamlit" / "secrets.toml"
 with open(_secrets_path, "rb") as f:
     _secrets = tomllib.load(f)
 
 WIKI_URL = f"{_secrets['WIKI_BASE_URL']}/graphql"
 API_TOKEN = _secrets["WIKI_API_TOKEN"]
+CHROMA_PATH = _secrets.get("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = _secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json"
 }
 
+# ==========================================
 # 벡터 DB 및 임베딩 설정
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+# ==========================================
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
 sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name="jhgan/ko-sroberta-multitask"
 )
 
 collection = chroma_client.get_or_create_collection(
-    name="wiki_knowledge",
+    name=COLLECTION_NAME,
     embedding_function=sentence_transformer_ef
 )
 
+# ==========================================
 # Wiki.js API
+# ==========================================
 def fetch_page_list():
     query = """
     query {
@@ -79,7 +89,9 @@ def fetch_page_content(page_id):
         return ""
 
 
+# ==========================================
 # 데이터 정제
+# ==========================================
 def is_noise_line(line):
     line = line.strip()
     if not line:
@@ -109,18 +121,14 @@ def clean_markdown(md_content):
     clean_text = " ".join(filtered_lines)
     return re.sub(r'\s+', ' ', clean_text).strip()
 
-def chunk_text(text, chunk_size=500, chunk_overlap=50):
-    chunks = []
-    if not text: return chunks
-    for i in range(0, len(text), chunk_size - chunk_overlap):
-        chunks.append(text[i:i + chunk_size])
-    return chunks
 
-
+# ==========================================
 # 벡터 DB 저장
+# ==========================================
 def save_to_vector_db(page, chunks):
-    if not chunks: return
-    
+    if not chunks:
+        return
+
     ids = [f"page_{page['id']}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [{
         "page_id": page['id'],
@@ -136,7 +144,9 @@ def save_to_vector_db(page, chunks):
     print(f"   (3) ChromaDB 저장 완료: {len(chunks)}개 청크 색인됨")
 
 
+# ==========================================
 # 메인 인덱싱 파이프라인
+# ==========================================
 def run_full_indexing():
     print("=== Wiki RAG 인덱싱 시작 (Noise Filtering 활성화) ===")
 
@@ -144,13 +154,12 @@ def run_full_indexing():
     try:
         count = collection.count()
         if count > 0:
-            # 컬렉션의 모든 ID를 가져와서 삭제 (where={} 방식이 안될 경우 대비)
             collection.delete(where={"page_id": {"$ne": -1}}) 
             print(f"-> 기존 데이터 {count}건을 삭제하여 초기화했습니다.")
     except Exception as e:
         print(f"-> 초기화 중 확인: {e}")
     
-    # 1. 목록 수집 (이 부분이 지워졌을 확률이 높습니다)
+    # 1. 목록 수집
     pages = fetch_page_list()
     if not pages:
         print("색인할 문서가 없습니다.")
@@ -159,7 +168,8 @@ def run_full_indexing():
     print(f"-> 총 {len(pages)}개의 문서를 발견했습니다.\n")
 
     for page in pages:
-        # [핵심 추가] PDF 임베딩 문서는 이미 app.py에서 원문을 DB에 직행시켰으므로 덮어쓰지 않고 스킵
+        # PDF 임베딩 문서는 app.py에서 이미 정제된 마크다운으로 색인했으므로
+        # indexer가 clean_markdown으로 표 등을 제거하면 안 됨 → 스킵
         page_tags = page.get('tags') or [] 
         if 'pdf' in page_tags:
             print(f"[{page['title']}] PDF 임베딩 문서는 인덱싱을 스킵합니다. (데이터 보존)")
