@@ -144,62 +144,96 @@ def save_to_vector_db(page, chunks):
     print(f"   (3) ChromaDB 저장 완료: {len(chunks)}개 청크 색인됨")
 
 
+def collect_existing_page_ids() -> set:
+    """ChromaDB에 현재 색인된 모든 page_id를 수집한다.
+
+    Wiki.js에서 삭제된 페이지의 잔여 청크를 정리하기 위해 사용.
+    """
+    try:
+        all_items = collection.get(include=["metadatas"])
+    except Exception as e:
+        print(f"-> ChromaDB 메타데이터 조회 실패: {e}")
+        return set()
+
+    existing_ids = set()
+    metadatas = all_items.get("metadatas") if all_items else None
+    if not metadatas:
+        return existing_ids
+
+    for m in metadatas:
+        if m and "page_id" in m:
+            existing_ids.add(m["page_id"])
+    return existing_ids
+
+
 # ==========================================
 # 메인 인덱싱 파이프라인
 # ==========================================
 def run_full_indexing():
     print("=== Wiki RAG 인덱싱 시작 (Noise Filtering 활성화) ===")
 
-    # 0. 기존 데이터 초기화
-    try:
-        count = collection.count()
-        if count > 0:
-            collection.delete(where={"page_id": {"$ne": -1}}) 
-            print(f"-> 기존 데이터 {count}건을 삭제하여 초기화했습니다.")
-    except Exception as e:
-        print(f"-> 초기화 중 확인: {e}")
-    
-    # 1. 목록 수집
+    # 1. 페이지 목록 수집
     pages = fetch_page_list()
     if not pages:
         print("색인할 문서가 없습니다.")
         return
 
-    print(f"-> 총 {len(pages)}개의 문서를 발견했습니다.\n")
+    # 2. PDF / 비-PDF 분류
+    pdf_pages = [p for p in pages if 'pdf' in (p.get('tags') or [])]
+    non_pdf_pages = [p for p in pages if 'pdf' not in (p.get('tags') or [])]
 
-    for page in pages:
-        # PDF 임베딩 문서는 app.py에서 이미 정제된 마크다운으로 색인했으므로
-        # indexer가 clean_markdown으로 표 등을 제거하면 안 됨 → 스킵
-        page_tags = page.get('tags') or [] 
-        if 'pdf' in page_tags:
-            print(f"[{page['title']}] PDF 임베딩 문서는 인덱싱을 스킵합니다. (데이터 보존)")
-            continue
+    wiki_page_ids = {p['id'] for p in pages}
+    non_pdf_ids = {p['id'] for p in non_pdf_pages}
 
+    print(f"-> 총 {len(pages)}개 문서 수집 "
+          f"(재색인 대상: {len(non_pdf_pages)}개 / PDF 임베딩 보존: {len(pdf_pages)}개)\n")
+
+    # 3. 선택적 청크 정리
+    #    (a) 재색인 대상 페이지의 기존 청크 삭제
+    #    (b) Wiki.js에서 삭제된 페이지의 잔여 청크 정리 (PDF였든 아니든)
+    existing_ids_in_db = collect_existing_page_ids()
+    orphan_ids = existing_ids_in_db - wiki_page_ids   # Wiki에 없는 page_id
+    to_delete = non_pdf_ids | orphan_ids
+
+    if to_delete:
+        try:
+            collection.delete(where={"page_id": {"$in": list(to_delete)}})
+            print(f"-> 청크 정리 완료: 재색인 대상 {len(non_pdf_ids)}개 페이지 + "
+                  f"Wiki 삭제분 {len(orphan_ids)}개 페이지\n")
+        except Exception as e:
+            print(f"-> 청크 정리 중 오류: {e}\n")
+    else:
+        print("-> 정리할 청크가 없습니다.\n")
+
+    # 4. 비-PDF 페이지 재색인
+    for page in non_pdf_pages:
         print(f"[{page['title']}] 처리 중...")
         
-        # 2. 본문 수집
         raw_content = fetch_page_content(page['id'])
         
         if raw_content:
-            # 3. 정제 및 분할
+            # 정제 및 분할
             clean_text = clean_markdown(raw_content)
             
             # 본문이 필터링 후 너무 짧아지면 스킵
             if len(clean_text) < 10:
                 print(f"   [정보] 필터링 후 유의미한 텍스트가 부족하여 스킵합니다.")
+                print(f"--- 처리 완료 ---\n")
                 continue
 
             chunks = chunk_text(clean_text)
             print(f"   (1) 정제 완료 (글자 수: {len(clean_text)})")
             print(f"   (2) 청킹 완료 (조각 수: {len(chunks)})")
             
-            # 4. 벡터 DB 저장
+            # 벡터 DB 저장
             save_to_vector_db(page, chunks)
         else:
             print(f"   [경고] 본문을 가져오지 못했습니다.")
         
         print(f"--- 처리 완료 ---\n")
 
+    if pdf_pages:
+        print(f"=== PDF 임베딩 문서 {len(pdf_pages)}개는 보존되었습니다. ===")
     print("=== 모든 인덱싱 공정이 성공적으로 종료되었습니다. ===")
 
 if __name__ == "__main__":
