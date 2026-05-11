@@ -1,0 +1,31 @@
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# 환경변수
+.env
+.env.*
+!.env.example
+
+# ChromaDB
+chroma_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 테스트 스크립트 (운영 코드 아님)
+RAG_chat.py
+search.py
+GITIGNORE_END
