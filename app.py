@@ -2,7 +2,6 @@ import streamlit as st
 import chromadb
 import requests
 import json
-import time
 import re
 import logging
 from chromadb.utils import embedding_functions
@@ -14,11 +13,10 @@ from chunker import chunk_text
 
 logger = logging.getLogger(__name__)
 
-# ==========================================
+
 # 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
-# ==========================================
+
 def reset_generation_state():
-    """진행 중인 작업 설정을 삭제하여 초기 입력 폼으로 돌아가게 합니다."""
     if 'generation_config' in st.session_state:
         del st.session_state.generation_config
     if 'raw_text' in st.session_state:
@@ -26,38 +24,31 @@ def reset_generation_state():
     if 'uploaded_file_buffer' in st.session_state:
         del st.session_state.uploaded_file_buffer
 
-# ==========================================
 # 설정 값 (st.secrets에서 로드)
-# ==========================================
+
+# Directory
 CHROMA_PATH = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
+# Wiki.js API
 WIKI_BASE_URL = st.secrets["WIKI_BASE_URL"]
 WIKI_URL = f"{WIKI_BASE_URL}/graphql"
 WIKI_API_TOKEN = st.secrets["WIKI_API_TOKEN"]
 
-# LM Studio (OpenAI 호환 엔드포인트) 설정
+# LM Studio (Search AI 모드 전용)
 AI_WORKER_IP = st.secrets["AI_WORKER_IP"]
 AI_WORKER_PORT = st.secrets.get("AI_WORKER_PORT", 1234)
 AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
 AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
 
-# ==========================================
 # 헬퍼 함수
-# ==========================================
 @st.cache_resource
 def load_vectordb():
-    # 검색 품질 향상을 위해 한국어 특화 임베딩 모델로 교체 적용
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="jhgan/ko-sroberta-multitask")
     client = chromadb.PersistentClient(path=CHROMA_PATH)
-    # DB 초기화 상황을 대비해 get_or_create_collection 사용
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=ef)
 
 def call_llm(messages, context):
-    """
-    LM Studio의 OpenAI 호환 엔드포인트(/v1/chat/completions)를 사용해
-    과거 대화 컨텍스트를 이어갑니다.
-    """
     url = AI_WORKER_ENDPOINT
 
     SYSTEM_PROMPT = (
@@ -118,7 +109,6 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
     """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
-
     indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
     """
     # 기존 청크 삭제 (없거나 실패해도 진행 가능)
@@ -144,15 +134,14 @@ def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=
         st.write(f"- **{doc['title']}** ({doc['path']}) / 유사도: {max(0, 1 - doc['distance']):.1%}")
     st.markdown("---")
     if st.button("덮어쓰기 (Update)", use_container_width=True):
-        st.session_state.generation_config = {'action': 'update', 'path': similar_docs[0]['path'], 'page_id': None, 'title': original_title}
+        st.session_state.generation_config['action'] = 'update'
+        st.session_state.generation_config['path'] = similar_docs[0]['path']
         st.rerun()
     if st.button("신규 생성", use_container_width=True):
-        st.session_state.generation_config = {'action': 'create', 'path': final_path, 'page_id': None, 'title': original_title}
+        st.session_state.generation_config['action'] = 'create'
         st.rerun()
 
-# ==========================================
 # 메인 UI
-# ==========================================
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 try:
     collection = load_vectordb()
@@ -179,7 +168,6 @@ if app_mode == "Search AI":
         with st.chat_message("assistant"):
             res = collection.query(query_texts=[prompt], n_results=3)
 
-            # [방어적 프로그래밍] None 값이 섞여 들어오면 안전하게 무시합니다.
             if not res['documents'] or not res['documents'][0]:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
@@ -219,30 +207,49 @@ elif app_mode == "PDF -> Wiki Data":
                         is_exists, existing_id = wiki_builder.check_page_exists(WIKI_URL, WIKI_API_TOKEN, final_path)
                         similar = search_similar_titles(collection, title)
 
-                    if is_exists: overwrite_confirm_dialog([{'title': title, 'path': final_path, 'distance': 0}], title, final_path, True)
-                    elif similar: overwrite_confirm_dialog(similar, title, final_path)
+                    # 공통: 작업 설정 초안 (action은 분기에서 결정)
+                    base_config = {
+                        'action': 'create',
+                        'path': final_path,
+                        'page_id': None,
+                        'title': title
+                    }
+
+                    if is_exists:
+                        st.session_state.generation_config = base_config
+                        overwrite_confirm_dialog(
+                            [{'title': title, 'path': final_path, 'distance': 0}],
+                            title, final_path, True
+                        )
+                    elif similar:
+                        st.session_state.generation_config = base_config
+                        overwrite_confirm_dialog(similar, title, final_path)
                     else:
-                        st.session_state.generation_config = {'action': 'create', 'path': final_path, 'page_id': None, 'title': title}
+                        st.session_state.generation_config = base_config
                         st.rerun()
     else:
         config = st.session_state.generation_config
-        st.info(f"🚀 AI 파이프라인 가동 (대상: {config['path']})")
+        st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
 
         try:
-            with st.chat_message("assistant"):
-                st.write("📝 **마크다운 정제 중...**")
-                refined_md = st.write_stream(
-                    wiki_builder.refine_text_with_llm(
-                        st.session_state.raw_text, AI_MODEL_NAME, AI_WORKER_ENDPOINT
-                    )
-                )
+            # PyMuPDF 추출 원본을 그대로 사용
+            refined_md = st.session_state.raw_text
+            with st.expander("📄 추출된 마크다운 미리보기", expanded=False):
+                st.markdown(refined_md)
+            st.success(f"✅ 추출 완료 (길이: {len(refined_md):,}자)")
 
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
                     _, existing_id = wiki_builder.check_page_exists(WIKI_URL, WIKI_API_TOKEN, config['path'])
-                    page_id = wiki_builder.update_wikijs_page(WIKI_URL, WIKI_API_TOKEN, existing_id, config['title'], refined_md, config['path'])
+                    page_id = wiki_builder.update_wikijs_page(
+                        WIKI_URL, WIKI_API_TOKEN, existing_id,
+                        config['title'], refined_md, config['path']
+                    )
                 else:
-                    page_id = wiki_builder.create_wikijs_page(WIKI_URL, WIKI_API_TOKEN, config['title'], refined_md, config['path'])
+                    page_id = wiki_builder.create_wikijs_page(
+                        WIKI_URL, WIKI_API_TOKEN,
+                        config['title'], refined_md, config['path']
+                    )
                 st.success(f"✅ 위키 반영 완료 (ID: {page_id})")
 
             with st.spinner("RAG 엔진 동기화 중..."):

@@ -1,7 +1,6 @@
 import requests
-import json
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Tuple
 import fitz  # PyMuPDF
 import pymupdf4llm
 from io import BytesIO
@@ -19,7 +18,7 @@ def _fix_graphql_url(url: str) -> str:
     return url
 
 def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
-    """PyMuPDF를 활용해 PDF의 표와 레이아웃을 마크다운 형태로 1차 추출합니다."""
+    """PyMuPDF를 활용해 PDF의 표와 레이아웃을 마크다운 형태로 추출합니다."""
     try:
         pdf_file_obj.seek(0)
         doc = fitz.open(stream=pdf_file_obj.read(), filetype="pdf")
@@ -28,85 +27,6 @@ def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
     except Exception as e:
         logger.error(f"PDF 추출 실패: {e}")
         raise WikiBuilderError(f"PDF 파싱 에러: {str(e)}")
-
-def refine_text_with_llm(raw_text: str,
-                          model_name: str = "gemma-3n-e4b-it-text",
-                          endpoint: str = "http://localhost:1234/v1/chat/completions"):
-    """LM Studio(OpenAI 호환) 스트리밍으로 마크다운을 정제합니다.
-
-    청킹을 통해 누락 없이 정제하며 표 구조를 보존합니다.
-    """
-    system_prompt = (
-        "당신은 PDF Text를 마크다운(Markdown) 포맷으로 변환하는 전문 테크니컬 라이터입니다. "
-        "사용자가 제공한 텍스트의 내용을 단 한 글자도 누락하거나 요약하지 마십시오. "
-        "특히 입력 데이터에 이미 표(Table) 형태가 포함되어 있다면 그 구조와 데이터를 절대 변경하지 마십시오. "
-        "본문 외의 인사말이나 부연 설명은 절대 출력하지 마십시오. "
-        "문서를 작성할 때 절대 코드 블록을 만들지 마십시오."
-    )
-
-    # 청크 분할
-    paragraphs = raw_text.split('\n\n')
-    chunks = []
-    current_chunk = ""
-
-    for p in paragraphs:
-        if len(current_chunk) + len(p) < 2000:
-            current_chunk += p + "\n\n"
-        else:
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            current_chunk = p + "\n\n"
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-
-    for idx, chunk in enumerate(chunks):
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content":
-                 f"다음 텍스트를 마크다운으로 작성하라. 단, 작성시 '```markdown'을 절대 포함하지 말것:\n\n{chunk}"}
-            ],
-            "stream": True,
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "max_tokens": 6144
-        }
-
-        try:
-            response = requests.post(
-                endpoint,
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                json=payload,
-                timeout=300,
-                stream=True
-            )
-            response.raise_for_status()
-            response.encoding = 'utf-8'  # SSE 응답 인코딩 강제
-
-            # 바이트로 받아 명시적 UTF-8 디코딩 (Latin-1 오해독 방지)
-            for raw_line in response.iter_lines(decode_unicode=False):
-                if not raw_line:
-                    continue
-                line = raw_line.decode('utf-8', errors='replace')
-                if line.startswith("data: "):
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        piece = delta.get("content", "")
-                        if piece:
-                            yield piece
-                    except json.JSONDecodeError:
-                        continue
-            yield "\n\n"
-
-        except Exception as e:
-            logger.error(f"LM Studio 오류 (Chunk {idx+1}/{len(chunks)}): {str(e)}")
-            yield "\n\n**[오류: 일부 구간 변환 실패]**\n\n"
-
 
 def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: str = "ko") -> Tuple[bool, Optional[int]]:
     # path로 페이지 존재 여부를 단건 조회
