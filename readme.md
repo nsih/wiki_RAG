@@ -1,3 +1,17 @@
+# 창신대학교 정보전산원 Wiki & RAG PoC 테스트 위키
+
+이곳은 **창신대학교 정보전산원**에서 진행하는 Wiki.js 및 RAG(Retrieval-Augmented Generation) 기술 검증을 위한 PoC(Proof of Concept) 테스트 환경입니다.
+
+
+
+## 안내 사항
+- 본 위키에 등록되는 모든 데이터는 기술 검증용 **샘플 데이터**입니다.
+- 실제 운영 환경의 민감 정보나 개인정보는 절대 입력하지 마십시오.
+- 실제 운영 환경에 해당 위키의 내용을 절대 적용하지 마십시오.
+- RAG 엔진의 색인 품질을 높이기 위해 문서는 가급적 지정된 템플릿에 맞춰 작성해 주시기 바랍니다.
+
+
+
 # CSU Wiki AI — 사내 위키 RAG 챗봇
 
 사내 Wiki.js 문서를 기반으로 한국어 질의응답을 제공하는 RAG(Retrieval-Augmented Generation) 챗봇입니다.
@@ -134,11 +148,6 @@ RRF Score = Σ [ 1 / (k + rank_i) ]   (k = 60)
 ## 설치 및 실행
 
 ### 의존성 설치
-
-```bash
-pip install -r requirements.txt
-```
-
 `requirements.txt` 주요 항목:
 
 ```
@@ -152,21 +161,6 @@ markdown
 beautifulsoup4
 requests
 ```
-
-### BM25 인덱스 초기 빌드
-
-ChromaDB 인덱싱과 BM25 빌드를 함께 수행합니다.
-
-```bash
-python indexer.py
-```
-
-### 앱 실행
-
-```bash
-streamlit run app.py
-```
-
 ---
 
 ## 설정 파일
