@@ -10,9 +10,9 @@ from chromadb.utils import embedding_functions
 
 from chunker import chunk_text
 
-# ==========================================
+
 # 설정 로드 (secrets.toml)
-# ==========================================
+
 _secrets_path = Path(__file__).parent / ".streamlit" / "secrets.toml"
 with open(_secrets_path, "rb") as f:
     _secrets = tomllib.load(f)
@@ -27,9 +27,9 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# ==========================================
+
 # 벡터 DB 및 임베딩 설정
-# ==========================================
+
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
 sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -41,9 +41,9 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=sentence_transformer_ef
 )
 
-# ==========================================
+
 # Wiki.js API
-# ==========================================
+
 def fetch_page_list():
     query = """
     query {
@@ -89,9 +89,9 @@ def fetch_page_content(page_id):
         return ""
 
 
-# ==========================================
+
 # 데이터 정제
-# ==========================================
+
 def is_noise_line(line):
     line = line.strip()
     if not line:
@@ -122,9 +122,9 @@ def clean_markdown(md_content):
     return re.sub(r'\s+', ' ', clean_text).strip()
 
 
-# ==========================================
+
 # 벡터 DB 저장
-# ==========================================
+
 def save_to_vector_db(page, chunks):
     if not chunks:
         return
@@ -145,9 +145,8 @@ def save_to_vector_db(page, chunks):
 
 
 def collect_existing_page_ids() -> set:
-    """ChromaDB에 현재 색인된 모든 page_id를 수집한다.
-
-    Wiki.js에서 삭제된 페이지의 잔여 청크를 정리하기 위해 사용.
+    """ChromaDB에 현재 색인된 모든 page_id를 수집
+    Wiki.js에서 삭제된 페이지의 잔여 청크를 정리하기 위해 사용
     """
     try:
         all_items = collection.get(include=["metadatas"])
@@ -166,16 +165,15 @@ def collect_existing_page_ids() -> set:
     return existing_ids
 
 
-# ==========================================
 # 메인 인덱싱 파이프라인
-# ==========================================
+
 def run_full_indexing():
     print("=== Wiki RAG 인덱싱 시작 (Noise Filtering 활성화) ===")
 
     # 1. 페이지 목록 수집
     pages = fetch_page_list()
     if not pages:
-        print("색인할 문서가 없습니다.")
+        print("pages null")
         return
 
     # 2. PDF / 비-PDF 분류

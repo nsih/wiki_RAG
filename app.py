@@ -36,9 +36,11 @@ WIKI_BASE_URL = st.secrets["WIKI_BASE_URL"]
 WIKI_URL = f"{WIKI_BASE_URL}/graphql"
 WIKI_API_TOKEN = st.secrets["WIKI_API_TOKEN"]
 
+# LM Studio (OpenAI 호환 엔드포인트) 설정
 AI_WORKER_IP = st.secrets["AI_WORKER_IP"]
-AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:11434/api/generate"
-AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "qwen2.5:7b")
+AI_WORKER_PORT = st.secrets.get("AI_WORKER_PORT", 1234)
+AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
+AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
 
 # ==========================================
 # 헬퍼 함수
@@ -53,44 +55,53 @@ def load_vectordb():
 
 def call_llm(messages, context):
     """
-    외부 API 대신 사내 연산 서버의 Ollama(/api/chat)를 사용하여 
-    보안을 유지하고 과거 대화 컨텍스트를 이어갑니다.
+    LM Studio의 OpenAI 호환 엔드포인트(/v1/chat/completions)를 사용해
+    과거 대화 컨텍스트를 이어갑니다.
     """
-    url = f"http://{AI_WORKER_IP}:11434/api/chat"
-    
+    url = AI_WORKER_ENDPOINT
+
+    SYSTEM_PROMPT = (
+        "당신은 사내 지식 기반 챗봇입니다. "
+        "답변은 반드시 한국어로, 제공되는 참고 문서를 바탕으로 "
+        "객관적이고 명확하게 답변하십시오."
+    )
+
     # 이전 대화 내역 포맷팅 (메모리 최적화를 위해 최근 4턴 유지)
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
-    formatted_messages = []
-    
+    formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
     for msg in recent_history:
         formatted_messages.append({
-            "role": msg["role"], 
+            "role": msg["role"],
             "content": msg["content"]
         })
-        
+
     # 마지막 '현재 질문'에 RAG 검색 컨텍스트 결합
     last_msg = messages[-1]["content"]
-    augmented_prompt = f"당신은 사내 지식 기반 챗봇입니다. 답변은 무조건 한국어를 사용하시고, 제공되는 참고 문서를 바탕으로 사용자의 질문에 객관적이고 명확하게 답변하십시오.\n\n[참고 문서]\n{context}\n\n[질문]\n{last_msg}"
+    augmented_prompt = f"[참고 문서]\n{context}\n\n[질문]\n{last_msg}"
     formatted_messages.append({"role": "user", "content": augmented_prompt})
-    
+
     payload = {
         "model": AI_MODEL_NAME,
         "messages": formatted_messages,
         "stream": False,
-        "options": {
-            "temperature": 0.2
-        }
+        "temperature": 0.2,
+        "max_tokens": 1024
     }
-    
+
     try:
-        # 내장 그래픽 환경에서의 7B 연산 지연을 고려해 타임아웃 상향
-        res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=120)
+        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
+        res = requests.post(
+            url, json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120
+        )
         if res.status_code == 200:
-            return res.json().get("message", {}).get("content", "응답 내용이 비어있습니다.")
+            return res.json()["choices"][0]["message"]["content"]
         else:
-            return f"Ollama 응답 오류: {res.status_code} - {res.text}"
+            return f"LM Studio 응답 오류: {res.status_code} - {res.text}"
     except Exception as e:
-        return f"Ollama 연산 서버({AI_WORKER_IP}) 통신 실패: {e}"
+        return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     results = collection.query(query_texts=[query_title], n_results=3, include=["metadatas", "distances"])
@@ -150,8 +161,8 @@ except Exception as e:
     st.stop()
 
 app_mode = st.sidebar.radio(
-    "모드 선택", 
-    ["Search AI", "PDF -> Wiki Data"], 
+    "모드 선택",
+    ["Search AI", "PDF -> Wiki Data"],
     on_change=reset_generation_state
 )
 
@@ -160,14 +171,14 @@ if app_mode == "Search AI":
     if "messages" not in st.session_state: st.session_state.messages = []
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]): st.markdown(msg["content"])
-        
+
     if prompt := st.chat_input("질문하세요"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
+
         with st.chat_message("assistant"):
             res = collection.query(query_texts=[prompt], n_results=3)
-            
+
             # [방어적 프로그래밍] None 값이 섞여 들어오면 안전하게 무시합니다.
             if not res['documents'] or not res['documents'][0]:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
@@ -178,21 +189,21 @@ if app_mode == "Search AI":
                     ctx = "\n---\n".join(valid_docs)
                 else:
                     ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
-                
+
                 valid_metas = [m for m in res['metadatas'][0] if m is not None]
                 titles = set([m.get('title', '제목 없음') for m in valid_metas])
-                
+
             ans = call_llm(st.session_state.messages, ctx)
-            
+
             if titles:
                 ans += "\n\n**[출처]**\n" + "\n".join([f"- {t}" for t in titles])
-                
+
             st.markdown(ans)
             st.session_state.messages.append({"role": "assistant", "content": ans})
 
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
-    
+
     if 'generation_config' not in st.session_state:
         with st.form("upload_form"):
             file = st.file_uploader("PDF 선택", type=["pdf"])
@@ -202,12 +213,12 @@ elif app_mode == "PDF -> Wiki Data":
                 if file and title:
                     safe_title = re.sub(r'[^\w가-힣-]', '', re.sub(r'[\s/]+', '-', title.strip()))
                     final_path = f"{dept}/{safe_title}"
-                    
+
                     with st.spinner("PDF 파싱 및 검사 중..."):
                         st.session_state.raw_text = wiki_builder.extract_text_from_pdf(BytesIO(file.getvalue()))
                         is_exists, existing_id = wiki_builder.check_page_exists(WIKI_URL, WIKI_API_TOKEN, final_path)
                         similar = search_similar_titles(collection, title)
-                    
+
                     if is_exists: overwrite_confirm_dialog([{'title': title, 'path': final_path, 'distance': 0}], title, final_path, True)
                     elif similar: overwrite_confirm_dialog(similar, title, final_path)
                     else:
@@ -216,11 +227,15 @@ elif app_mode == "PDF -> Wiki Data":
     else:
         config = st.session_state.generation_config
         st.info(f"🚀 AI 파이프라인 가동 (대상: {config['path']})")
-        
+
         try:
             with st.chat_message("assistant"):
                 st.write("📝 **마크다운 정제 중...**")
-                refined_md = st.write_stream(wiki_builder.refine_text_with_ollama(st.session_state.raw_text, AI_MODEL_NAME, AI_WORKER_ENDPOINT))
+                refined_md = st.write_stream(
+                    wiki_builder.refine_text_with_llm(
+                        st.session_state.raw_text, AI_MODEL_NAME, AI_WORKER_ENDPOINT
+                    )
+                )
 
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
@@ -229,7 +244,7 @@ elif app_mode == "PDF -> Wiki Data":
                 else:
                     page_id = wiki_builder.create_wikijs_page(WIKI_URL, WIKI_API_TOKEN, config['title'], refined_md, config['path'])
                 st.success(f"✅ 위키 반영 완료 (ID: {page_id})")
-            
+
             with st.spinner("RAG 엔진 동기화 중..."):
                 cnt = update_vector_db(collection, page_id, config['title'], config['path'], refined_md)
                 st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")

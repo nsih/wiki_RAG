@@ -29,22 +29,28 @@ def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
         logger.error(f"PDF 추출 실패: {e}")
         raise WikiBuilderError(f"PDF 파싱 에러: {str(e)}")
 
-def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpoint: str = "http://localhost:11434/api/generate"):
-    """청킹(Chunking)을 통해 누락 없이 마크다운을 정제하며, 표 구조를 100% 보존합니다."""
+def refine_text_with_llm(raw_text: str,
+                          model_name: str = "gemma-3n-e4b-it-text",
+                          endpoint: str = "http://localhost:1234/v1/chat/completions"):
+    """LM Studio(OpenAI 호환) 스트리밍으로 마크다운을 정제합니다.
+
+    청킹을 통해 누락 없이 정제하며 표 구조를 보존합니다.
+    """
     system_prompt = (
         "당신은 PDF Text를 마크다운(Markdown) 포맷으로 변환하는 전문 테크니컬 라이터입니다. "
         "사용자가 제공한 텍스트의 내용을 단 한 글자도 누락하거나 요약하지 마십시오. "
         "특히 입력 데이터에 이미 표(Table) 형태가 포함되어 있다면 그 구조와 데이터를 절대 변경하지 마십시오. "
-        "본문 외의 인사말이나 부연 설명은 절대 출력하지 마십시오."
-        "문서를 작성할 때 절대 블록을 만들지 마십시오"
+        "본문 외의 인사말이나 부연 설명은 절대 출력하지 마십시오. "
+        "문서를 작성할 때 절대 코드 블록을 만들지 마십시오."
     )
-    
+
+    # 청크 분할
     paragraphs = raw_text.split('\n\n')
     chunks = []
     current_chunk = ""
-    
+
     for p in paragraphs:
-        if len(current_chunk) + len(p) < 1500: 
+        if len(current_chunk) + len(p) < 2000:
             current_chunk += p + "\n\n"
         else:
             if current_chunk.strip():
@@ -56,33 +62,54 @@ def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpo
     for idx, chunk in enumerate(chunks):
         payload = {
             "model": model_name,
-            "prompt": f"다음 텍스트를 마크다운으로 작성하라. 단, 작성시 '```markdown'을 절대 포함하지 말것. :\n\n{chunk}",
-            "system": system_prompt,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content":
+                 f"다음 텍스트를 마크다운으로 작성하라. 단, 작성시 '```markdown'을 절대 포함하지 말것:\n\n{chunk}"}
+            ],
             "stream": True,
-            "options": {"temperature": 0.1, "top_p": 0.9}
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_tokens": 6144
         }
-        
+
         try:
-            response = requests.post(endpoint, headers={"Content-Type": "application/json"},
-                                     json=payload, timeout=300, stream=True)
+            response = requests.post(
+                endpoint,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                json=payload,
+                timeout=300,
+                stream=True
+            )
             response.raise_for_status()
-            
-            for line in response.iter_lines():
-                if line:
-                    data = json.loads(line.decode('utf-8'))
-                    response_piece = data.get("response", "")
-                    if response_piece:
-                        yield response_piece
-                    if data.get("done"):
+            response.encoding = 'utf-8'  # SSE 응답 인코딩 강제
+
+            # 바이트로 받아 명시적 UTF-8 디코딩 (Latin-1 오해독 방지)
+            for raw_line in response.iter_lines(decode_unicode=False):
+                if not raw_line:
+                    continue
+                line = raw_line.decode('utf-8', errors='replace')
+                if line.startswith("data: "):
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
                         break
+                    try:
+                        data = json.loads(data_str)
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        piece = delta.get("content", "")
+                        if piece:
+                            yield piece
+                    except json.JSONDecodeError:
+                        continue
             yield "\n\n"
-            
+
         except Exception as e:
-            logger.error(f"Ollama 오류 (Chunk {idx+1}/{len(chunks)}): {str(e)}")
-            yield f"\n\n**[오류: 일부 구간 변환 실패]**\n\n"
+            logger.error(f"LM Studio 오류 (Chunk {idx+1}/{len(chunks)}): {str(e)}")
+            yield "\n\n**[오류: 일부 구간 변환 실패]**\n\n"
+
 
 def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: str = "ko") -> Tuple[bool, Optional[int]]:
-    #path로 페이지 존재 여부를 단건 조회
+    # path로 페이지 존재 여부를 단건 조회
     wiki_url = _fix_graphql_url(wiki_url)
     query = """
     query ($path: String!, $locale: String!) {
@@ -95,7 +122,7 @@ def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: s
     """
     variables = {"path": target_path, "locale": locale}
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    
+
     try:
         response = requests.post(
             wiki_url, headers=headers,
@@ -104,7 +131,7 @@ def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: s
         )
         response.raise_for_status()
         data = response.json()
-        
+
         # GraphQL 에러 분기
         if data.get("errors"):
             for err in data["errors"]:
@@ -114,7 +141,7 @@ def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: s
             # 권한 외 에러 (보통 PageNotFound) → 페이지 없음으로 간주
             logger.debug(f"singleByPath 에러를 페이지 없음으로 처리: {data['errors']}")
             return False, None
-        
+
         page = data.get("data", {}).get("pages", {}).get("singleByPath")
         if page and page.get("id"):
             return True, int(page["id"])
@@ -126,7 +153,7 @@ def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: s
 
 def fetch_page_tags(wiki_url: str, api_token: str, page_id: int) -> list:
     """페이지의 기존 태그 목록을 가져옵니다. 업데이트 시 태그 보존용.
-    
+
     Note: pages.single은 tags를 [Tag] 객체 배열로 반환하므로 tag 필드를 꺼내야 함.
     (pages.list는 [String] 문자열 배열 - 다름)
     """
@@ -142,8 +169,8 @@ def fetch_page_tags(wiki_url: str, api_token: str, page_id: int) -> list:
     """
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
     try:
-        response = requests.post(wiki_url, headers=headers, 
-                                 json={"query": query, "variables": {"id": page_id}}, 
+        response = requests.post(wiki_url, headers=headers,
+                                 json={"query": query, "variables": {"id": page_id}},
                                  timeout=30)
         response.raise_for_status()
         tags_data = response.json().get("data", {}).get("pages", {}).get("single", {}).get("tags", [])
@@ -166,8 +193,8 @@ def create_wikijs_page(wiki_url: str, api_token: str, title: str, content: str, 
     }
     """
     variables = {
-        "content": content, 
-        "path": path, 
+        "content": content,
+        "path": path,
         "title": title,
         "tags": ["auto", "pdf"]  # 'pdf' 태그로 indexer가 스킵 판단
     }
@@ -175,11 +202,11 @@ def create_wikijs_page(wiki_url: str, api_token: str, title: str, content: str, 
 
 def update_wikijs_page(wiki_url: str, api_token: str, page_id: int, title: str, content: str, path: str) -> int:
     wiki_url = _fix_graphql_url(wiki_url)
-    
+
     # 기존 태그 보존 + 'pdf' 태그 보장 (사용자가 수동으로 추가한 태그도 유지)
     existing_tags = fetch_page_tags(wiki_url, api_token, page_id)
     merged_tags = list(set(existing_tags + ["pdf", "updated"]))
-    
+
     query = """
     mutation UpdatePage($id: Int!, $content: String!, $path: String!, $title: String!, $tags: [String]!) {
       pages {
@@ -192,10 +219,10 @@ def update_wikijs_page(wiki_url: str, api_token: str, page_id: int, title: str, 
     }
     """
     variables = {
-        "id": page_id, 
-        "content": content, 
-        "path": path, 
-        "title": title, 
+        "id": page_id,
+        "content": content,
+        "path": path,
+        "title": title,
         "tags": merged_tags
     }
     return _execute_mutation(wiki_url, api_token, query, variables, "update")
