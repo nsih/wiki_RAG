@@ -32,11 +32,11 @@ def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
 def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpoint: str = "http://localhost:11434/api/generate"):
     """청킹(Chunking)을 통해 누락 없이 마크다운을 정제하며, 표 구조를 100% 보존합니다."""
     system_prompt = (
-        "당신은 문서를 마크다운(Markdown) 포맷으로 변환하는 전문 테크니컬 라이터입니다. "
+        "당신은 PDF Text를 마크다운(Markdown) 포맷으로 변환하는 전문 테크니컬 라이터입니다. "
         "사용자가 제공한 텍스트의 내용을 단 한 글자도 누락하거나 요약하지 마십시오. "
-        "특히 입력 데이터에 이미 표(Table) 형태의 마크다운(|---|---|)이 포함되어 있다면 그 구조와 데이터를 절대 변경하지 마십시오. "
+        "특히 입력 데이터에 이미 표(Table) 형태가 포함되어 있다면 그 구조와 데이터를 절대 변경하지 마십시오. "
         "본문 외의 인사말이나 부연 설명은 절대 출력하지 마십시오."
-        "문서 맨 위에 '```markdown'을 표시하지 마십시오"
+        "문서를 작성할 때 절대 블록을 만들지 마십시오"
     )
     
     paragraphs = raw_text.split('\n\n')
@@ -56,7 +56,7 @@ def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpo
     for idx, chunk in enumerate(chunks):
         payload = {
             "model": model_name,
-            "prompt": f"다음 텍스트를 마크다운으로 변환해라:\n\n{chunk}",
+            "prompt": f"다음 텍스트를 마크다운으로 작성하라. 단, 작성시 '```markdown'을 절대 포함하지 말것. :\n\n{chunk}",
             "system": system_prompt,
             "stream": True,
             "options": {"temperature": 0.1, "top_p": 0.9}
@@ -82,15 +82,7 @@ def refine_text_with_ollama(raw_text: str, model_name: str = "qwen2.5:7b", endpo
             yield f"\n\n**[오류: 일부 구간 변환 실패]**\n\n"
 
 def check_page_exists(wiki_url: str, api_token: str, target_path: str, locale: str = "ko") -> Tuple[bool, Optional[int]]:
-    """path로 페이지 존재 여부를 단건 조회한다. O(1).
-
-    기존엔 pages.list로 전체 페이지를 받아 path를 매칭하는 O(N) 방식이라
-    문서 수가 늘면 응답 크기와 지연이 함께 커졌다. singleByPath로 변경.
-
-    Wiki.js v2의 singleByPath는 페이지가 없으면 GraphQL 에러를 반환하므로,
-    'PageNotFound' 등 일반 에러는 (False, None)으로 처리하되,
-    권한/인증 관련 에러는 명시적으로 raise하여 환경 문제를 빨리 드러낸다.
-    """
+    #path로 페이지 존재 여부를 단건 조회
     wiki_url = _fix_graphql_url(wiki_url)
     query = """
     query ($path: String!, $locale: String!) {
