@@ -1,6 +1,6 @@
-# 창신대학교 정보전산원 Wiki & RAG PoC 테스트 위키
+# Wiki & RAG PoC
 
-이곳은 **창신대학교 정보전산원**에서 진행하는 Wiki.js 및 RAG(Retrieval-Augmented Generation) 기술 검증을 위한 PoC(Proof of Concept) 테스트 환경입니다.
+Wiki.js 및 RAG(Retrieval-Augmented Generation) 기술 검증을 위한 PoC(Proof of Concept) 테스트 환경입니다.
 
 
 
@@ -12,7 +12,7 @@
 
 
 
-# CSU Wiki AI — 사내 위키 RAG 챗봇
+# Wiki AI — 사내 위키 RAG 챗봇
 
 사내 Wiki.js 문서를 기반으로 한국어 질의응답을 제공하는 RAG(Retrieval-Augmented Generation) 챗봇입니다.
 PDF를 위키 페이지로 자동 변환하는 기능도 함께 제공합니다.
