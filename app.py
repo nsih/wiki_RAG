@@ -65,12 +65,12 @@ def call_llm(messages, context):
     url = AI_WORKER_ENDPOINT
 
     SYSTEM_PROMPT = (
-        "당신은 사내 지식 기반 챗봇입니다. "
+        "당신은 RAG 챗봇입니다. "
         "답변은 반드시 한국어로, 제공되는 참고 문서를 바탕으로 "
         "객관적이고 명확하게 답변하십시오."
     )
 
-    # 이전 대화 내역 포맷팅 (메모리 최적화를 위해 최근 4턴 유지)
+    # 이전 대화 내역 포맷팅 (4턴 유지)
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
     formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 

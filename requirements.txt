@@ -1,0 +1,17 @@
+streamlit
+requests
+
+# 벡터DB + 임베딩
+chromadb
+sentence-transformers
+
+# BM25
+rank_bm25
+
+# PDF 처리
+pymupdf
+pymupdf4llm
+
+# 마크다운 정제
+markdown
+beautifulsoup4
