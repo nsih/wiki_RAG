@@ -9,6 +9,8 @@ from io import BytesIO
 
 # 코어 모듈 임포트
 import wiki_builder
+import bm25_store
+from retriever import hybrid_search
 from chunker import chunk_text
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ def reset_generation_state():
         del st.session_state.raw_text
     if 'uploaded_file_buffer' in st.session_state:
         del st.session_state.uploaded_file_buffer
+
 
 # 설정 값 (st.secrets에서 로드)
 
@@ -41,12 +44,22 @@ AI_WORKER_PORT = st.secrets.get("AI_WORKER_PORT", 1234)
 AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
 AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
 
+
 # 헬퍼 함수
+
 @st.cache_resource
 def load_vectordb():
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="jhgan/ko-sroberta-multitask")
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="jhgan/ko-sroberta-multitask"
+    )
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=ef)
+
+@st.cache_resource
+def load_bm25_index():
+    """앱 시작 시 한 번만 로드. 파일 없으면 None 반환 → 벡터 단독 폴백."""
+    bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
+    return bm25_store.load(bm25_path)
 
 def call_llm(messages, context):
     url = AI_WORKER_ENDPOINT
@@ -128,8 +141,10 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
 
 @st.dialog("⚠️ 중복 감지")
 def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=False):
-    if is_exact: st.error(f"동일 경로(`{final_path}`)가 이미 존재합니다.")
-    else: st.warning("유사한 문서가 발견되었습니다.")
+    if is_exact:
+        st.error(f"동일 경로(`{final_path}`)가 이미 존재합니다.")
+    else:
+        st.warning("유사한 문서가 발견되었습니다.")
     for doc in similar_docs:
         st.write(f"- **{doc['title']}** ({doc['path']}) / 유사도: {max(0, 1 - doc['distance']):.1%}")
     st.markdown("---")
@@ -141,10 +156,14 @@ def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=
         st.session_state.generation_config['action'] = 'create'
         st.rerun()
 
+
 # 메인 UI
+
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
+
 try:
     collection = load_vectordb()
+    bm25_index = load_bm25_index()
 except Exception as e:
     st.error(f"DB 로드 실패: {e}")
     st.stop()
@@ -157,29 +176,27 @@ app_mode = st.sidebar.radio(
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
-    if "messages" not in st.session_state: st.session_state.messages = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
     if prompt := st.chat_input("질문하세요"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            res = collection.query(query_texts=[prompt], n_results=3)
+            # Hybrid Search (BM25 없으면 벡터 단독 폴백)
+            hits = hybrid_search(collection, bm25_index, prompt, top_n=5, candidates=20)
 
-            if not res['documents'] or not res['documents'][0]:
+            if not hits:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
             else:
-                valid_docs = [doc for doc in res['documents'][0] if doc is not None]
-                if valid_docs:
-                    ctx = "\n---\n".join(valid_docs)
-                else:
-                    ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
-
-                valid_metas = [m for m in res['metadatas'][0] if m is not None]
-                titles = set([m.get('title', '제목 없음') for m in valid_metas])
+                ctx = "\n---\n".join(h["document"] for h in hits if h["document"])
+                titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
             ans = call_llm(st.session_state.messages, ctx)
 
@@ -203,8 +220,12 @@ elif app_mode == "PDF -> Wiki Data":
                     final_path = f"{dept}/{safe_title}"
 
                     with st.spinner("PDF 파싱 및 검사 중..."):
-                        st.session_state.raw_text = wiki_builder.extract_text_from_pdf(BytesIO(file.getvalue()))
-                        is_exists, existing_id = wiki_builder.check_page_exists(WIKI_URL, WIKI_API_TOKEN, final_path)
+                        st.session_state.raw_text = wiki_builder.extract_text_from_pdf(
+                            BytesIO(file.getvalue())
+                        )
+                        is_exists, existing_id = wiki_builder.check_page_exists(
+                            WIKI_URL, WIKI_API_TOKEN, final_path
+                        )
                         similar = search_similar_titles(collection, title)
 
                     # 공통: 작업 설정 초안 (action은 분기에서 결정)
@@ -240,7 +261,9 @@ elif app_mode == "PDF -> Wiki Data":
 
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
-                    _, existing_id = wiki_builder.check_page_exists(WIKI_URL, WIKI_API_TOKEN, config['path'])
+                    _, existing_id = wiki_builder.check_page_exists(
+                        WIKI_URL, WIKI_API_TOKEN, config['path']
+                    )
                     page_id = wiki_builder.update_wikijs_page(
                         WIKI_URL, WIKI_API_TOKEN, existing_id,
                         config['title'], refined_md, config['path']
@@ -253,8 +276,26 @@ elif app_mode == "PDF -> Wiki Data":
                 st.success(f"✅ 위키 반영 완료 (ID: {page_id})")
 
             with st.spinner("RAG 엔진 동기화 중..."):
-                cnt = update_vector_db(collection, page_id, config['title'], config['path'], refined_md)
+                cnt = update_vector_db(
+                    collection, page_id, config['title'], config['path'], refined_md
+                )
                 st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
+
+            # BM25 인덱스 메모리 패치 (디스크 미반영 — 다음 indexer 배치에서 정식 반영)
+            try:
+                new_chunk_ids = [f"page_{page_id}_chunk_{i}" for i in range(cnt)]
+                if config['action'] == 'update':
+                    # 기존 청크 제거 후 신규 청크 추가
+                    old_chunk_ids = [
+                        cid for cid in bm25_index.chunk_ids
+                        if cid.startswith(f"page_{page_id}_chunk_")
+                    ] if bm25_index else []
+                    if old_chunk_ids:
+                        bm25_store.patch_remove(bm25_index, old_chunk_ids)
+                if bm25_index is not None:
+                    bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
+            except Exception as e:
+                logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 
             st.button("새로운 작업 시작", on_click=reset_generation_state, type="primary")
 

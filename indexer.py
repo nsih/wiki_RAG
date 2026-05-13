@@ -2,6 +2,9 @@ import requests
 import json
 import re
 import tomllib
+import bm25_store
+
+
 from pathlib import Path
 import chromadb
 from markdown import markdown
@@ -229,6 +232,16 @@ def run_full_indexing():
             print(f"   [경고] 본문을 가져오지 못했습니다.")
         
         print(f"--- 처리 완료 ---\n")
+
+    # ── BM25 인덱스 빌드 및 저장 ──────────────────────────────────────────
+    bm25_path = _secrets.get("BM25_PATH", "./bm25_index.pkl")
+    print("=== BM25 인덱스 빌드 중... ===")
+    try:
+        bm25_idx = bm25_store.build_from_chroma(collection)
+        bm25_store.save(bm25_idx, bm25_path)
+        print(f"=== BM25 인덱스 저장 완료: {bm25_path} ({len(bm25_idx.chunk_ids)}개 청크) ===")
+    except Exception as e:
+        print(f"=== [경고] BM25 빌드 실패 (다음 실행 시 재시도): {e} ===")
 
     if pdf_pages:
         print(f"=== PDF 임베딩 문서 {len(pdf_pages)}개는 보존되었습니다. ===")
