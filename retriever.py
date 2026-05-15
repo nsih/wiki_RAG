@@ -9,19 +9,21 @@ logger = logging.getLogger(__name__)
 
 # ── RRF ─────────────────────────────────────────────────────────────────────
 
-def _rrf(rankings: list[list[str]], k: int = 60, top_n: int = 5) -> list[str]:
-    """Reciprocal Rank Fusion — 여러 랭킹 리스트를 하나로 융합한다.
+def _rrf(rankings: list[list[str]], k: int = 60,
+         top_n: int = 5) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion — 여러 랭킹 리스트를 융합해 (chunk_id, score) 쌍을 반환.
 
-    score(d) = Σ [ 1 / (k + rank_i(d)) ]
-    rank_i는 1-based. 리스트에 없는 문서는 해당 검색기 점수 기여 없음.
+    score(d) = Σ [ 1 / (k + rank_i(d)) ]    (rank_i는 1-based)
+
+    리스트에 없는 문서는 해당 검색기에서 점수 기여 없음.
+    점수까지 함께 반환해 호출측이 디버깅/튜닝 시 실제 RRF 값을 그대로 확인할 수 있다.
     """
     scores: dict[str, float] = defaultdict(float)
     for ranking in rankings:
         for rank, chunk_id in enumerate(ranking, start=1):
             scores[chunk_id] += 1.0 / (k + rank)
 
-    sorted_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)
-    return sorted_ids[:top_n]
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 
 # ── Hybrid Search ────────────────────────────────────────────────────────────
@@ -39,14 +41,30 @@ def hybrid_search(
     반환 dict 키: chunk_id, document, metadata, vec_rank, bm25_rank, rrf_score
     """
 
+    # ── 0. 빈 컬렉션 가드 ───────────────────────────────────────────────────
+    # 인덱싱이 한 번도 안 된 초기 상태에서 ChromaDB query를 호출하면
+    # 내부적으로 거리 계산이 비어 오류가 날 수 있어 미리 분기한다.
+    try:
+        coll_size = collection.count()
+    except Exception as e:
+        logger.warning(f"collection.count() 실패 — 0으로 간주: {e}")
+        coll_size = 0
+
+    if coll_size == 0:
+        logger.debug("빈 컬렉션 — hybrid_search 즉시 종료")
+        return []
+
     # ── 1. 벡터 검색 ────────────────────────────────────────────────────────
     vec_results = collection.query(
         query_texts=[query],
-        n_results=min(candidates, collection.count()),
+        n_results=min(candidates, coll_size),
         include=["documents", "metadatas", "distances"],
     )
 
-    vec_ids: list[str] = vec_results["ids"][0] if vec_results["ids"] else []
+    # ChromaDB는 결과가 없으면 [[]] 형태로 응답하므로 빈 리스트로 평탄화
+    vec_ids: list[str] = (vec_results["ids"][0]
+                          if vec_results.get("ids") and vec_results["ids"]
+                          else [])
     vec_docs: dict[str, str] = {}
     vec_metas: dict[str, dict] = {}
 
@@ -62,15 +80,19 @@ def hybrid_search(
     if bm25_index is not None and bm25_index.chunk_ids:
         try:
             query_tokens = tokenize_ko(query)
-            scores = bm25_index.bm25.get_scores(query_tokens)
+            # 토큰이 모두 필터링되면(예: 한 글자 질의) BM25 호출을 건너뛴다.
+            if query_tokens:
+                scores = bm25_index.bm25.get_scores(query_tokens)
 
-            # 점수 내림차순 정렬 → 상위 candidates개 추출
-            top_indices = sorted(
-                range(len(scores)), key=lambda i: scores[i], reverse=True
-            )[:candidates]
+                # 점수 내림차순 정렬 → 상위 candidates개 추출
+                top_indices = sorted(
+                    range(len(scores)), key=lambda i: scores[i], reverse=True
+                )[:candidates]
 
-            bm25_ids = [bm25_index.chunk_ids[i] for i in top_indices
-                        if scores[i] > 0]  # 점수 0 이하는 무관 문서 — 제외
+                bm25_ids = [bm25_index.chunk_ids[i] for i in top_indices
+                            if scores[i] > 0]  # 0 이하는 무관 문서 — 제외
+            else:
+                logger.debug("BM25 쿼리 토큰이 비어 — BM25 단계 스킵")
         except Exception as e:
             logger.warning(f"BM25 검색 실패, 벡터 단독으로 폴백: {e}")
     else:
@@ -79,27 +101,37 @@ def hybrid_search(
     bm25_rank_map: dict[str, int] = {cid: r + 1 for r, cid in enumerate(bm25_ids)}
 
     # ── 3. RRF 융합 ─────────────────────────────────────────────────────────
-    rankings = [vec_ids]
+    rankings: list[list[str]] = []
+    if vec_ids:
+        rankings.append(vec_ids)
     if bm25_ids:
         rankings.append(bm25_ids)
 
-    fused_ids = _rrf(rankings, k=60, top_n=top_n)
+    if not rankings:
+        # 두 검색기 모두 결과가 없는 극단적 케이스
+        logger.debug("벡터/BM25 모두 결과 없음")
+        return []
 
-    # ── 4. 결과 조립 ─────────────────────────────────────────────────────────
-    # BM25에만 있는 청크는 ChromaDB에서 본문·메타데이터를 보완한다
+    fused: list[tuple[str, float]] = _rrf(rankings, k=60, top_n=top_n)
+    fused_ids = [cid for cid, _ in fused]
+    rrf_score_map = dict(fused)  # ← 단일 호출 결과를 그대로 사용 (실제 RRF 점수)
+
+    # ── 4. BM25 전용 청크 본문 보완 ─────────────────────────────────────────
+    # BM25에만 있고 벡터 결과엔 없는 청크는 ChromaDB에서 본문·메타데이터를 가져와야 한다.
     missing = [cid for cid in fused_ids if cid not in vec_docs]
     if missing:
         try:
             extra = collection.get(ids=missing, include=["documents", "metadatas"])
-            for i, cid in enumerate(extra["ids"]):
-                vec_docs[cid] = (extra["documents"][i] or "")
-                vec_metas[cid] = (extra["metadatas"][i] or {})
+            extra_ids = extra.get("ids") or []
+            extra_docs = extra.get("documents") or []
+            extra_metas = extra.get("metadatas") or []
+            for i, cid in enumerate(extra_ids):
+                vec_docs[cid] = (extra_docs[i] if i < len(extra_docs) else "") or ""
+                vec_metas[cid] = (extra_metas[i] if i < len(extra_metas) else {}) or {}
         except Exception as e:
             logger.warning(f"BM25 전용 청크 본문 조회 실패: {e}")
 
-    rrf_scores = _rrf(rankings, k=60, top_n=len(fused_ids) + top_n)  # 점수 역산용
-    rrf_score_map = {cid: 1.0 / (60 + r + 1) for r, cid in enumerate(rrf_scores)}
-
+    # ── 5. 결과 조립 ─────────────────────────────────────────────────────────
     results: list[dict] = []
     for cid in fused_ids:
         results.append({
