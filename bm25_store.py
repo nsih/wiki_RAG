@@ -94,8 +94,7 @@ def patch_add(index: BM25Index, new_chunk_ids: list[str], new_documents: list[st
     except Exception as e:
         logger.warning(f"BM25 patch_add 실패 (다음 배치에서 복구됨): {e}")
         raise
-
-
+#r
 def patch_remove(index: BM25Index, chunk_ids: list[str]) -> None:
     """업데이트 전 기존 청크를 메모리에서 제거한다.
 
