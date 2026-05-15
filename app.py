@@ -71,7 +71,7 @@ def call_llm(messages, context):
     )
 
     # 이전 대화 내역 포맷팅 (4턴 유지)
-    recent_history = messages[:-1][-4:] if len(messages) > 1 else []
+    recent_history = messages[:-1][-2:] if len(messages) > 1 else []
     formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     for msg in recent_history:
@@ -108,11 +108,7 @@ def call_llm(messages, context):
         return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
-    """유사 문서 검색. page_id까지 함께 반환해 후속 update 호출에서 재조회를 막는다."""
-    results = collection.query(
-        query_texts=[query_title], n_results=3,
-        include=["metadatas", "distances"]
-    )
+    results = collection.query(query_texts=[query_title], n_results=3, include=["metadatas", "distances"])
     similar = []
     seen = set()
     if results['ids'] and results['ids'][0]:
@@ -120,12 +116,7 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
             meta = results['metadatas'][0][i]
             dist = results['distances'][0][i]
             if dist <= threshold and meta is not None and 'path' in meta and meta['path'] not in seen:
-                similar.append({
-                    "title": meta['title'],
-                    "path": meta['path'],
-                    "page_id": meta.get('page_id'),  # ChromaDB ↔ Wiki.js 동기화 직후엔 신뢰 가능
-                    "distance": dist
-                })
+                similar.append({"title": meta['title'], "path": meta['path'], "distance": dist})
                 seen.add(meta['path'])
     return similar
 
@@ -160,14 +151,9 @@ def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=
     if st.button("덮어쓰기 (Update)", use_container_width=True):
         st.session_state.generation_config['action'] = 'update'
         st.session_state.generation_config['path'] = similar_docs[0]['path']
-        # 유사 문서 케이스: ChromaDB 메타에서 받아온 page_id를 그대로 전달
-        # (is_exact=True 케이스에선 폼 분기에서 이미 채워둠)
-        if not is_exact:
-            st.session_state.generation_config['page_id'] = similar_docs[0].get('page_id')
         st.rerun()
     if st.button("신규 생성", use_container_width=True):
         st.session_state.generation_config['action'] = 'create'
-        st.session_state.generation_config['page_id'] = None
         st.rerun()
 
 
@@ -203,7 +189,7 @@ if app_mode == "Search AI":
 
         with st.chat_message("assistant"):
             # Hybrid Search (BM25 없으면 벡터 단독 폴백)
-            hits = hybrid_search(collection, bm25_index, prompt, top_n=5, candidates=20)
+            hits = hybrid_search(collection, bm25_index, prompt, top_n=3, candidates=20)
 
             if not hits:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
@@ -242,21 +228,18 @@ elif app_mode == "PDF -> Wiki Data":
                         )
                         similar = search_similar_titles(collection, title)
 
-                    # 공통: 작업 설정 초안
-                    # 정확 일치 케이스의 existing_id를 여기서 미리 채워, 처리 블록에서의 재조회를 제거한다.
-                    # 유사 문서 케이스의 page_id는 다이얼로그 선택 시점에 채운다.
+                    # 공통: 작업 설정 초안 (action은 분기에서 결정)
                     base_config = {
                         'action': 'create',
                         'path': final_path,
-                        'page_id': existing_id if is_exists else None,
+                        'page_id': None,
                         'title': title
                     }
 
                     if is_exists:
                         st.session_state.generation_config = base_config
                         overwrite_confirm_dialog(
-                            [{'title': title, 'path': final_path,
-                              'page_id': existing_id, 'distance': 0}],
+                            [{'title': title, 'path': final_path, 'distance': 0}],
                             title, final_path, True
                         )
                     elif similar:
@@ -278,30 +261,13 @@ elif app_mode == "PDF -> Wiki Data":
 
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
-                    existing_id = config.get('page_id')
-
-                    # 폴백 1: page_id가 없는 비정상 경로(예: 세션 잔존 데이터) 방어
-                    # 폴백 2: 사용자 확인 ~ 실제 전송 사이에 페이지가 삭제됐을 가능성 방어
-                    if existing_id is None:
-                        logger.info(
-                            f"config에 page_id 없음 — 재확인 수행 (path={config['path']})"
-                        )
-                        _, existing_id = wiki_builder.check_page_exists(
-                            WIKI_URL, WIKI_API_TOKEN, config['path']
-                        )
-
-                    if existing_id is None:
-                        # 대상이 사라졌다면 create로 폴백 (사용자에게 명시)
-                        st.warning("대상 페이지를 찾지 못해 신규 생성으로 전환합니다.")
-                        page_id = wiki_builder.create_wikijs_page(
-                            WIKI_URL, WIKI_API_TOKEN,
-                            config['title'], refined_md, config['path']
-                        )
-                    else:
-                        page_id = wiki_builder.update_wikijs_page(
-                            WIKI_URL, WIKI_API_TOKEN, existing_id,
-                            config['title'], refined_md, config['path']
-                        )
+                    _, existing_id = wiki_builder.check_page_exists(
+                        WIKI_URL, WIKI_API_TOKEN, config['path']
+                    )
+                    page_id = wiki_builder.update_wikijs_page(
+                        WIKI_URL, WIKI_API_TOKEN, existing_id,
+                        config['title'], refined_md, config['path']
+                    )
                 else:
                     page_id = wiki_builder.create_wikijs_page(
                         WIKI_URL, WIKI_API_TOKEN,
