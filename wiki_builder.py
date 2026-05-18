@@ -108,7 +108,8 @@ def _merge_page_breaks(md_text: str) -> str:
     
     result = ''.join(merged_parts)
     result = re.sub(r'([가-힣a-zA-Z])-\n([가-힣a-zA-Z])', r'\1\2', result)
-    
+
+
     lines = result.split('\n')
     out = []
     for line in lines:
