@@ -86,7 +86,7 @@ def _handle_graphql_errors(errors: list, *, raise_on_other: bool) -> bool:
 import re
 
 def _merge_page_breaks(md_text: str) -> str:
-    page_sep = re.compile(r'\n{0,2}-{3,}\n{0,2}')
+    page_sep = re.compile(r'\n{0,2}(?<!\|)-{3,}(?!\|)\n{0,2}')
     
     segments = page_sep.split(md_text)
     merged_parts = []
@@ -99,16 +99,30 @@ def _merge_page_breaks(md_text: str) -> str:
         prev_tail = merged_parts[-1].rstrip()
         cur_head = seg.lstrip()
         
-        if prev_tail and not prev_tail[-1] in '.。!?|#\n':
+        if prev_tail.endswith('|') and cur_head.startswith('|'):
+            merged_parts[-1] = prev_tail + '\n' + cur_head
+        elif prev_tail and prev_tail[-1] not in '.。!?|#\n':
             merged_parts[-1] = prev_tail + cur_head
         else:
             merged_parts[-1] = prev_tail + '\n\n' + cur_head
     
     result = ''.join(merged_parts)
-    
-    # 하이픈 줄바꿈 처리: "신-\n청" → "신청"
     result = re.sub(r'([가-힣a-zA-Z])-\n([가-힣a-zA-Z])', r'\1\2', result)
     
+    lines = result.split('\n')
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^\|(?:[-:]+\|)+$', stripped):
+            prev = next((l.strip() for l in reversed(out) if l.strip()), '')
+            if re.match(r'^\|\s*\d+\s*\|', prev):  # 직전이 데이터 행이면 제거
+                continue
+        out.append(line)
+
+    result = '\n'.join(out)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = re.sub(r'(\|[^\n]+)\n\n+(\|)', r'\1\n\2', result)
+
     return result
 
 
