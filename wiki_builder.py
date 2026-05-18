@@ -83,18 +83,40 @@ def _handle_graphql_errors(errors: list, *, raise_on_other: bool) -> bool:
 
 # ── PDF 추출 ────────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
-    """PyMuPDF를 활용해 PDF의 표와 레이아웃을 마크다운 형태로 추출합니다.
+import re
 
-    fitz.Document은 컨텍스트 매니저로 명시 해제해 4GB 환경에서의 누수 위험을 차단한다.
-    """
+def _merge_page_breaks(md_text: str) -> str:
+    # pymupdf4llm 페이지 구분선 패턴 (---/*** 등 변형 포함)
+    page_sep = re.compile(r'\n{0,2}-{3,}\n{0,2}')
+    
+    segments = page_sep.split(md_text)
+    merged_parts = []
+    
+    for i, seg in enumerate(segments):
+        if i == 0:
+            merged_parts.append(seg)
+            continue
+        
+        prev_tail = merged_parts[-1].rstrip()
+        cur_head = seg.lstrip()
+        
+        # 이전 세그먼트가 문장 중간에 끊긴 경우 (마침표/느낌표/물음표/표 행 없음)
+        if prev_tail and not prev_tail[-1] in '.。!?|#\n':
+            # 단어가 이어지는 경우 — 공백 없이 붙임
+            merged_parts[-1] = prev_tail + cur_head
+        else:
+            # 문단 경계로 간주 — 줄바꿈 유지
+            merged_parts[-1] = prev_tail + '\n\n' + cur_head
+    
+    return ''.join(merged_parts)
+
+
+def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
     try:
         pdf_file_obj.seek(0)
-        # with 블록으로 doc.close() 보장 — pymupdf4llm가 내부적으로 페이지를 순회한 뒤에도
-        # GC 타이밍에 의존하지 않고 즉시 자원을 반납한다.
-        with fitz.open(stream=pdf_file_obj.read(), filetype="pdf") as doc:
-            md_text = pymupdf4llm.to_markdown(doc)
-        return md_text
+        doc = fitz.open(stream=pdf_file_obj.read(), filetype="pdf")
+        md_text = pymupdf4llm.to_markdown(doc)
+        return _merge_page_breaks(md_text)  # ← 추가
     except Exception as e:
         logger.error(f"PDF 추출 실패: {e}")
         raise WikiBuilderError(f"PDF 파싱 에러: {str(e)}")
