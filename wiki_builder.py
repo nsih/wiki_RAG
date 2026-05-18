@@ -86,7 +86,6 @@ def _handle_graphql_errors(errors: list, *, raise_on_other: bool) -> bool:
 import re
 
 def _merge_page_breaks(md_text: str) -> str:
-    # pymupdf4llm 페이지 구분선 패턴 (---/*** 등 변형 포함)
     page_sep = re.compile(r'\n{0,2}-{3,}\n{0,2}')
     
     segments = page_sep.split(md_text)
@@ -100,15 +99,17 @@ def _merge_page_breaks(md_text: str) -> str:
         prev_tail = merged_parts[-1].rstrip()
         cur_head = seg.lstrip()
         
-        # 이전 세그먼트가 문장 중간에 끊긴 경우 (마침표/느낌표/물음표/표 행 없음)
         if prev_tail and not prev_tail[-1] in '.。!?|#\n':
-            # 단어가 이어지는 경우 — 공백 없이 붙임
             merged_parts[-1] = prev_tail + cur_head
         else:
-            # 문단 경계로 간주 — 줄바꿈 유지
             merged_parts[-1] = prev_tail + '\n\n' + cur_head
     
-    return ''.join(merged_parts)
+    result = ''.join(merged_parts)
+    
+    # 하이픈 줄바꿈 처리: "신-\n청" → "신청"
+    result = re.sub(r'([가-힣a-zA-Z])-\n([가-힣a-zA-Z])', r'\1\2', result)
+    
+    return result
 
 
 def extract_text_from_pdf(pdf_file_obj: BytesIO) -> str:
