@@ -4,6 +4,7 @@ import requests
 import json
 import re
 import logging
+import threading
 from chromadb.utils import embedding_functions
 from io import BytesIO
 
@@ -14,6 +15,9 @@ from retriever import hybrid_search
 from chunker import chunk_text
 
 logger = logging.getLogger(__name__)
+
+# BM25 in-place 패치 보호용 락 (멀티스레드 동시 업로드 방어)
+_bm25_lock = threading.Lock()
 
 
 # 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
@@ -70,8 +74,9 @@ def call_llm(messages, context):
         "객관적이고 명확하게 답변하십시오."
     )
 
-    # 이전 대화 내역 포맷팅 (4턴 유지)
-    recent_history = messages[:-1][-2:] if len(messages) > 1 else []
+    # 이전 대화 내역 포맷팅
+    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
+    recent_history = messages[:-1][-4:] if len(messages) > 1 else []
     formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     for msg in recent_history:
@@ -92,7 +97,7 @@ def call_llm(messages, context):
         "temperature": 0.2,
         "max_tokens": 1024
     }
-    
+
     try:
         # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(
@@ -174,6 +179,17 @@ app_mode = st.sidebar.radio(
     on_change=reset_generation_state
 )
 
+# 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
+import os, datetime
+bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
+if os.path.exists(bm25_path):
+    mtime = os.path.getmtime(bm25_path)
+    st.sidebar.caption(
+        f"인덱스 최종 갱신: {datetime.datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}"
+    )
+else:
+    st.sidebar.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
     if "messages" not in st.session_state:
@@ -195,7 +211,8 @@ if app_mode == "Search AI":
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
             else:
-                ctx = "\n---\n".join(h["document"] for h in hits if h["document"])
+                # 빈 document 필터링 — 토큰 낭비 방지
+                ctx = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
                 titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
             ans = call_llm(st.session_state.messages, ctx)
@@ -282,18 +299,20 @@ elif app_mode == "PDF -> Wiki Data":
                 st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
 
             # BM25 인덱스 메모리 패치 (디스크 미반영 — 다음 indexer 배치에서 정식 반영)
+            # _bm25_lock으로 보호 — 동시 업로드 시 race condition 방지
             try:
                 new_chunk_ids = [f"page_{page_id}_chunk_{i}" for i in range(cnt)]
-                if config['action'] == 'update':
-                    # 기존 청크 제거 후 신규 청크 추가
-                    old_chunk_ids = [
-                        cid for cid in bm25_index.chunk_ids
-                        if cid.startswith(f"page_{page_id}_chunk_")
-                    ] if bm25_index else []
-                    if old_chunk_ids:
-                        bm25_store.patch_remove(bm25_index, old_chunk_ids)
-                if bm25_index is not None:
-                    bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
+                with _bm25_lock:
+                    if config['action'] == 'update':
+                        # 기존 청크 제거 후 신규 청크 추가
+                        old_chunk_ids = [
+                            cid for cid in bm25_index.chunk_ids
+                            if cid.startswith(f"page_{page_id}_chunk_")
+                        ] if bm25_index else []
+                        if old_chunk_ids:
+                            bm25_store.patch_remove(bm25_index, old_chunk_ids)
+                    if bm25_index is not None:
+                        bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 
