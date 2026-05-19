@@ -168,7 +168,6 @@ def collect_existing_page_ids() -> set:
     return existing_ids
 
 
-# 메인 인덱싱 파이프라인
 
 def run_full_indexing():
     print("=== Wiki RAG 인덱싱 시작 (Noise Filtering 활성화) ===")

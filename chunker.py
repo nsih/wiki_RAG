@@ -27,4 +27,5 @@ def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> lis
         )
 
     step = chunk_size - chunk_overlap
-    return [text[i:i + chunk_size] for i in range(0, len(text), step)]
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), step)]
+    return [c for c in chunks if c.strip()]

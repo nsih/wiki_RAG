@@ -92,7 +92,7 @@ def call_llm(messages, context):
         "temperature": 0.2,
         "max_tokens": 1024
     }
-
+    
     try:
         # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(

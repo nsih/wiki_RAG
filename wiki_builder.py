@@ -97,28 +97,29 @@ def _merge_page_breaks(md_text: str) -> str:
             continue
         
         prev_tail = merged_parts[-1].rstrip()
-        cur_head = seg.lstrip()
+        cur_head = seg.lstrip() 
         
-        if prev_tail.endswith('|') and cur_head.startswith('|'):
-            merged_parts[-1] = prev_tail + '\n' + cur_head
-        elif prev_tail and prev_tail[-1] not in '.。!?|#\n':
+        if prev_tail.endswith('|') and cur_head.startswith('|'): 
+            merged_parts[-1] = prev_tail + '\n' + cur_head 
+        elif prev_tail and prev_tail[-1] not in '.。!?|#\n': 
             merged_parts[-1] = prev_tail + cur_head
         else:
-            merged_parts[-1] = prev_tail + '\n\n' + cur_head
+            merged_parts[-1] = prev_tail + '\n\n' + cur_head 
     
-    result = ''.join(merged_parts)
-    result = re.sub(r'([가-힣a-zA-Z])-\n([가-힣a-zA-Z])', r'\1\2', result)
+    result = ''.join(merged_parts) 
+    result = re.sub(r'([가-힣a-zA-Z])-\n([가-힣a-zA-Z])', r'\1\2', result) 
 
 
-    lines = result.split('\n')
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        if re.match(r'^\|(?:[-:]+\|)+$', stripped):
-            prev = next((l.strip() for l in reversed(out) if l.strip()), '')
-            if re.match(r'^\|\s*\d+\s*\|', prev):  # 직전이 데이터 행이면 제거
-                continue
-        out.append(line)
+    lines = result.split('\n') 
+    out = [] 
+    for line in lines: 
+        stripped = line.strip() 
+        if re.match(r'^\|(?:[-:]+\|)+$', stripped): 
+            prev = next((l.strip() for l in reversed(out) if l.strip()), '') 
+            if re.match(r'^\|\s*\d+\s*\|', prev):  # 직전이 데이터 행이면 제거 
+                continue 
+        out.append(line) 
+
 
     result = '\n'.join(out)
     result = re.sub(r'\n{3,}', '\n\n', result)
