@@ -5,6 +5,8 @@ import json
 import re
 import logging
 import threading
+import os
+import datetime
 from chromadb.utils import embedding_functions
 from io import BytesIO
 
@@ -23,12 +25,13 @@ _bm25_lock = threading.Lock()
 # 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
 
 def reset_generation_state():
-    if 'generation_config' in st.session_state:
-        del st.session_state.generation_config
-    if 'raw_text' in st.session_state:
-        del st.session_state.raw_text
-    if 'uploaded_file_buffer' in st.session_state:
-        del st.session_state.uploaded_file_buffer
+    """PDF→Wiki 모드의 작업 상태를 모두 정리한다.
+
+    pending_check: form 단계와 confirm 단계 사이의 중간 상태
+    generation_config: confirm 단계에서 결정된 action 포함한 최종 작업 설정
+    """
+    for k in ('generation_config', 'raw_text', 'uploaded_file_buffer', 'pending_check'):
+        st.session_state.pop(k, None)
 
 
 # 설정 값 (st.secrets에서 로드)
@@ -49,6 +52,8 @@ AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completion
 AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
 
 
+# 헬퍼 함수
+
 @st.cache_resource
 def load_vectordb():
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -57,11 +62,13 @@ def load_vectordb():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=ef)
 
+
 @st.cache_resource
 def load_bm25_index():
     """앱 시작 시 한 번만 로드. 파일 없으면 None 반환 → 벡터 단독 폴백."""
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     return bm25_store.load(bm25_path)
+
 
 def call_llm(messages, context):
     url = AI_WORKER_ENDPOINT
@@ -73,7 +80,7 @@ def call_llm(messages, context):
     )
 
     # 이전 대화 내역 포맷팅
-    # [-4:]
+    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
     formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -97,11 +104,11 @@ def call_llm(messages, context):
     }
 
     try:
-        # 타임아웃
+        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(
             url, json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=180
+            timeout=120
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -109,6 +116,7 @@ def call_llm(messages, context):
             return f"LM Studio 응답 오류: {res.status_code} - {res.text}"
     except Exception as e:
         return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
+
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     results = collection.query(query_texts=[query_title], n_results=3, include=["metadatas", "distances"])
@@ -123,16 +131,17 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
                 seen.add(meta['path'])
     return similar
 
+
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    """
-    페이지의 기존 청크 삭제 후 재색인
+    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
     indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
     """
     # 기존 청크 삭제 (없거나 실패해도 진행 가능)
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
-        logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}") 
+        logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}")
+
     chunks = chunk_text(content)
     if not chunks:
         return 0
@@ -141,23 +150,6 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     metas = [{"page_id": page_id, "title": title, "path": path} for _ in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
-
-@st.dialog("⚠️ 중복 감지")
-def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=False):
-    if is_exact:
-        st.error(f"동일 경로(`{final_path}`) 감지")
-    else:
-        st.warning("유사 문서 발견")
-    for doc in similar_docs:
-        st.write(f"- **{doc['title']}** ({doc['path']}) / 유사도: {max(0, 1 - doc['distance']):.1%}")
-    st.markdown("---")
-    if st.button("덮어쓰기 (Update)", use_container_width=True):
-        st.session_state.generation_config['action'] = 'update'
-        st.session_state.generation_config['path'] = similar_docs[0]['path']
-        st.rerun()
-    if st.button("신규 생성", use_container_width=True):
-        st.session_state.generation_config['action'] = 'create'
-        st.rerun()
 
 
 # 메인 UI
@@ -178,7 +170,6 @@ app_mode = st.sidebar.radio(
 )
 
 # 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
-import os, datetime
 bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
 if os.path.exists(bm25_path):
     mtime = os.path.getmtime(bm25_path)
@@ -224,45 +215,112 @@ if app_mode == "Search AI":
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 상태 전이:
+    #   (없음) ── form 제출 ──▶ pending_check ── 사용자 선택 ──▶ generation_config
+    #                          │                                    │
+    #                          └─ 중복 없음: 바로 generation_config ─┘
+    #
+    # 주의: st.dialog는 Streamlit 1.57 기준 닫힘이 불안정한 알려진 버그가 있어
+    # (issue #13009 등), 모달 대신 inline confirmation UI로 처리한다.
+    # ─────────────────────────────────────────────────────────────────────
+
     if 'generation_config' not in st.session_state:
-        with st.form("upload_form"):
-            file = st.file_uploader("PDF 선택", type=["pdf"])
-            dept = st.selectbox("부서", ["공통", "정보전산원", "교무처", "학생처", "기획처"])
-            title = st.text_input("문서 제목")
-            if st.form_submit_button("시작"):
-                if file and title:
-                    safe_title = re.sub(r'[^\w가-힣-]', '', re.sub(r'[\s/]+', '-', title.strip()))
-                    final_path = f"{dept}/{safe_title}"
 
-                    with st.spinner("PDF 파싱 및 검사 중..."):
-                        st.session_state.raw_text = wiki_builder.extract_text_from_pdf(
-                            BytesIO(file.getvalue())
-                        )
-                        is_exists, existing_id = wiki_builder.check_page_exists(
-                            WIKI_URL, WIKI_API_TOKEN, final_path
-                        )
-                        similar = search_similar_titles(collection, title)
+        if 'pending_check' not in st.session_state:
+            # ── 1단계: form은 데이터 수집과 중복 검사만 ──
+            with st.form("upload_form"):
+                file = st.file_uploader("PDF 선택", type=["pdf"])
+                dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
+                title = st.text_input("문서 제목")
+                if st.form_submit_button("시작"):
+                    if file and title:
+                        safe_title = re.sub(r'[^\w가-힣-]', '',
+                                            re.sub(r'[\s/]+', '-', title.strip()))
+                        final_path = f"{dept}/{safe_title}"
 
-                    # 공통: 작업 설정 초안 (action은 분기에서 결정)
-                    base_config = {
-                        'action': 'create',
-                        'path': final_path,
-                        'page_id': None,
-                        'title': title
-                    }
+                        with st.spinner("PDF 파싱 및 검사 중..."):
+                            st.session_state.raw_text = wiki_builder.extract_text_from_pdf(
+                                BytesIO(file.getvalue())
+                            )
+                            is_exists, _ = wiki_builder.check_page_exists(
+                                WIKI_URL, WIKI_API_TOKEN, final_path
+                            )
+                            similar = search_similar_titles(collection, title)
 
-                    if is_exists:
-                        st.session_state.generation_config = base_config
-                        overwrite_confirm_dialog(
-                            [{'title': title, 'path': final_path, 'distance': 0}],
-                            title, final_path, True
-                        )
-                    elif similar:
-                        st.session_state.generation_config = base_config
-                        overwrite_confirm_dialog(similar, title, final_path)
-                    else:
-                        st.session_state.generation_config = base_config
+                        # 중복/유사 검사 결과를 stash. 다음 rerun에서 inline UI 렌더.
+                        st.session_state.pending_check = {
+                            'is_exists': is_exists,
+                            'similar': similar,
+                            'title': title,
+                            'final_path': final_path,
+                        }
                         st.rerun()
+        else:
+            # ── 2단계: inline confirmation UI ──
+            pending = st.session_state.pending_check
+            base_config = {
+                'action': 'create',
+                'path': pending['final_path'],
+                'page_id': None,
+                'title': pending['title'],
+            }
+
+            if pending['is_exists']:
+                # 동일 경로 존재 — 덮어쓰기 / 취소 둘 중 하나
+                st.error(f"⚠️ 동일 경로(`{pending['final_path']}`)가 이미 존재합니다.")
+                st.write(f"- **{pending['title']}** ({pending['final_path']})")
+                st.markdown("---")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("덮어쓰기 (Update)", type="primary",
+                                 use_container_width=True, key="cf_overwrite_exact"):
+                        base_config['action'] = 'update'
+                        st.session_state.generation_config = base_config
+                        st.session_state.pop('pending_check', None)
+                        st.rerun()
+                with col2:
+                    if st.button("취소", use_container_width=True, key="cf_cancel_exact"):
+                        reset_generation_state()
+                        st.rerun()
+
+            elif pending['similar']:
+                # 유사 문서 발견 — 덮어쓰기 / 신규 생성 / 취소
+                st.warning("⚠️ 유사한 문서가 발견되었습니다.")
+                for doc in pending['similar']:
+                    st.write(
+                        f"- **{doc['title']}** ({doc['path']}) / "
+                        f"유사도: {max(0, 1 - doc['distance']):.1%}"
+                    )
+                st.markdown("---")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if st.button("덮어쓰기 (Update)", type="primary",
+                                 use_container_width=True, key="cf_overwrite_sim"):
+                        base_config['action'] = 'update'
+                        base_config['path'] = pending['similar'][0]['path']
+                        st.session_state.generation_config = base_config
+                        st.session_state.pop('pending_check', None)
+                        st.rerun()
+                with col2:
+                    if st.button("신규 생성", use_container_width=True, key="cf_create_sim"):
+                        base_config['action'] = 'create'
+                        st.session_state.generation_config = base_config
+                        st.session_state.pop('pending_check', None)
+                        st.rerun()
+                with col3:
+                    if st.button("취소", use_container_width=True, key="cf_cancel_sim"):
+                        reset_generation_state()
+                        st.rerun()
+
+            else:
+                # 중복 없음 — 바로 처리 단계로
+                st.session_state.generation_config = base_config
+                del st.session_state.pending_check
+                st.rerun()
+
     else:
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
@@ -274,8 +332,6 @@ elif app_mode == "PDF -> Wiki Data":
                 st.markdown(refined_md)
             st.success(f"✅ 추출 완료 (길이: {len(refined_md):,}자)")
 
-            
-
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
                     _, existing_id = wiki_builder.check_page_exists(
@@ -285,7 +341,7 @@ elif app_mode == "PDF -> Wiki Data":
                         WIKI_URL, WIKI_API_TOKEN, existing_id,
                         config['title'], refined_md, config['path']
                     )
-                else: 
+                else:
                     page_id = wiki_builder.create_wikijs_page(
                         WIKI_URL, WIKI_API_TOKEN,
                         config['title'], refined_md, config['path']
