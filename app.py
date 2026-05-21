@@ -49,8 +49,6 @@ AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completion
 AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
 
 
-# 헬퍼 함수
-
 @st.cache_resource
 def load_vectordb():
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -75,7 +73,7 @@ def call_llm(messages, context):
     )
 
     # 이전 대화 내역 포맷팅
-    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
+    # [-4:]
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
     formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -99,11 +97,11 @@ def call_llm(messages, context):
     }
 
     try:
-        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
+        # 타임아웃
         res = requests.post(
             url, json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=120
+            timeout=180
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -126,15 +124,15 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     return similar
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
+    """
+    페이지의 기존 청크 삭제 후 재색인
     indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
     """
     # 기존 청크 삭제 (없거나 실패해도 진행 가능)
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
-        logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}")
-
+        logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}") 
     chunks = chunk_text(content)
     if not chunks:
         return 0
@@ -147,9 +145,9 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
 @st.dialog("⚠️ 중복 감지")
 def overwrite_confirm_dialog(similar_docs, original_title, final_path, is_exact=False):
     if is_exact:
-        st.error(f"동일 경로(`{final_path}`)가 이미 존재합니다.")
+        st.error(f"동일 경로(`{final_path}`) 감지")
     else:
-        st.warning("유사한 문서가 발견되었습니다.")
+        st.warning("유사 문서 발견")
     for doc in similar_docs:
         st.write(f"- **{doc['title']}** ({doc['path']}) / 유사도: {max(0, 1 - doc['distance']):.1%}")
     st.markdown("---")
@@ -229,7 +227,7 @@ elif app_mode == "PDF -> Wiki Data":
     if 'generation_config' not in st.session_state:
         with st.form("upload_form"):
             file = st.file_uploader("PDF 선택", type=["pdf"])
-            dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
+            dept = st.selectbox("부서", ["공통", "정보전산원", "교무처", "학생처", "기획처"])
             title = st.text_input("문서 제목")
             if st.form_submit_button("시작"):
                 if file and title:
@@ -276,6 +274,8 @@ elif app_mode == "PDF -> Wiki Data":
                 st.markdown(refined_md)
             st.success(f"✅ 추출 완료 (길이: {len(refined_md):,}자)")
 
+            
+
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
                     _, existing_id = wiki_builder.check_page_exists(
@@ -285,7 +285,7 @@ elif app_mode == "PDF -> Wiki Data":
                         WIKI_URL, WIKI_API_TOKEN, existing_id,
                         config['title'], refined_md, config['path']
                     )
-                else:
+                else: 
                     page_id = wiki_builder.create_wikijs_page(
                         WIKI_URL, WIKI_API_TOKEN,
                         config['title'], refined_md, config['path']
