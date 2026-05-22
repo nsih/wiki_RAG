@@ -171,11 +171,18 @@ app_mode = st.sidebar.radio(
 
 # 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
 bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
+
 if os.path.exists(bm25_path):
     mtime = os.path.getmtime(bm25_path)
-    st.sidebar.caption(
-        f"인덱스 최종 갱신: {datetime.datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}"
-    )
+    base_time = datetime.datetime.fromtimestamp(mtime)
+    
+
+    last_patch = st.session_state.get("bm25_last_patch")
+    display_time = last_patch if last_patch else base_time
+    label = "인덱스 최종 갱신 (메모리)" if last_patch else "인덱스 최종 갱신"
+    
+    st.sidebar.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
+
 else:
     st.sidebar.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
 
@@ -214,16 +221,6 @@ if app_mode == "Search AI":
 
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # 상태 전이:
-    #   (없음) ── form 제출 ──▶ pending_check ── 사용자 선택 ──▶ generation_config
-    #                          │                                    │
-    #                          └─ 중복 없음: 바로 generation_config ─┘
-    #
-    # 주의: st.dialog는 Streamlit 1.57 기준 닫힘이 불안정한 알려진 버그가 있어
-    # (issue #13009 등), 모달 대신 inline confirmation UI로 처리한다.
-    # ─────────────────────────────────────────────────────────────────────
 
     if 'generation_config' not in st.session_state:
 
@@ -369,6 +366,7 @@ elif app_mode == "PDF -> Wiki Data":
                             bm25_store.patch_remove(bm25_index, old_chunk_ids)
                     if bm25_index is not None:
                         bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
+                        st.session_state["bm25_last_patch"] = datetime.datetime.now()
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 
