@@ -74,13 +74,11 @@ def call_llm(messages, context):
 
     SYSTEM_PROMPT = (
         "당신은 RAG 챗봇입니다. "
-        "답변은 반드시 한국어로, 제공되는 참고 문서를 바탕으로 "
-        "객관적이고 명확하게 답변하십시오."
+        "답변은 반드시 한국어로, 제공되는 참고 문서를 바탕으로 객관적이고 명확하게 답변해주세요. "
     )
 
     # 이전 대화 내역 포맷팅
-    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
-    recent_history = messages[:-1][-4:] if len(messages) > 1 else []
+    recent_history = messages[:-1][-5:] if len(messages) > 1 else []
 
     # Gemma는 'system' 롤을 지원하지 않음
     # → 시스템 프롬프트를 첫 번째 user 메시지 앞에 인라인으로 병합
@@ -139,9 +137,7 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
 
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
-    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
-    """
+    #기존 청크를 삭제 후 재색인
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
@@ -158,11 +154,8 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
 
 
 def render_bm25_status(placeholder):
-    """BM25 인덱스 갱신 시각을 플레이스홀더에 렌더링한다.
+    #BM25 인덱스 갱신 시각을 플레이스홀더에 렌더링
 
-    플레이스홀더를 인자로 받아 BM25 패치 완료 후 즉시 재호출하면
-    같은 실행 내에서 사이드바가 갱신된다 (st.rerun() 불필요).
-    """
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     if os.path.exists(bm25_path):
         mtime = os.path.getmtime(bm25_path)
@@ -195,13 +188,13 @@ app_mode = st.sidebar.radio(
 )
 
 # 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
-# empty() 플레이스홀더로 선언해두고, BM25 패치 완료 후 render_bm25_status()를
-# 재호출하면 같은 실행 내에서 값이 즉시 갱신된다.
+# empty() 플레이스홀더로 선언, 
+# BM25 패치 완료 후 render_bm25_status() 재호출시 같은 실행 내에서 즉시 갱신
 bm25_status_placeholder = st.sidebar.empty()
 render_bm25_status(bm25_status_placeholder)
 
 
-# ── Search AI 모드 ────────────────────────────────────────────────────────────
+# Search AI 모드
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
@@ -229,7 +222,7 @@ if app_mode == "Search AI":
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
             else:
-                # 빈 document 필터링 — 토큰 낭비 방지
+                # 빈 document 필터링
                 ctx = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
                 titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
@@ -242,15 +235,14 @@ if app_mode == "Search AI":
             st.session_state.messages.append({"role": "assistant", "content": ans})
 
 
-# ── PDF → Wiki Data 모드 ──────────────────────────────────────────────────────
-
+# PDF → Wiki Data 모드
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
 
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
+            # 1단계: form — 데이터 수집 및 중복 검사
             with st.form("upload_form"):
                 file = st.file_uploader("PDF 선택", type=["pdf"])
                 dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
@@ -280,7 +272,7 @@ elif app_mode == "PDF -> Wiki Data":
                         st.rerun()
 
         else:
-            # ── 2단계: inline confirmation UI ───────────────────────────────
+            # 2단계: inline confirmation UI
             pending = st.session_state.pending_check
             base_config = {
                 'action': 'create',
@@ -345,7 +337,7 @@ elif app_mode == "PDF -> Wiki Data":
                 st.rerun()
 
     else:
-        # ── 3단계: Wiki.js 반영 및 RAG 인덱싱 ──────────────────────────────
+        # 3단계: Wiki.js 반영 및 RAG 인덱싱
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
 

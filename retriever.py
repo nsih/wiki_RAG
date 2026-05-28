@@ -27,17 +27,15 @@ def _rrf(rankings: list[list[str]], k: int = 60,
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 
-# ── 인접 청크 확장 ────────────────────────────────────────────────────────────
+# 인접 청크 확장
 
 _CHUNK_RE = re.compile(r'^(page_\d+_chunk_)(\d+)$')
 
 
 def expand_chunks(collection, hits: list[dict], window: int = 1) -> list[dict]:
     """검색된 청크의 앞뒤 window개 청크를 ChromaDB에서 가져와 본문을 확장한다.
-
-    chunk_id 형식이 'page_{page_id}_chunk_{i}' 임을 이용해
-    인접 인덱스를 직접 조립한다. 존재하지 않는 인접 청크는 조용히 무시한다.
-
+    chunk format : 'page_{page_id}_chunk_{i}'
+    
     예) window=1 → 청크 #4 + #5(원본) + #6 을 이어붙여 반환
         window=2 → 청크 #3 + #4 + #5(원본) + #6 + #7
 
@@ -46,13 +44,12 @@ def expand_chunks(collection, hits: list[dict], window: int = 1) -> list[dict]:
         hits       : hybrid_search() 반환값
         window     : 앞뒤로 확장할 청크 수 (기본 1 → 전후 각 1개)
 
-    Returns:
-        hits와 동일 구조이나 document가 인접 청크를 포함한 확장 텍스트로 교체됨.
+    Returns: 단순 hit -> 인접 청크를 포함한 확장 텍스트로 교체
     """
     if not hits:
         return hits
 
-    # ── 수집 대상 인접 ID 계산 ───────────────────────────────────────────
+    # 수집 대상 인접 ID 계산
     neighbor_ids: set[str] = set()
 
     for hit in hits:
@@ -69,7 +66,7 @@ def expand_chunks(collection, hits: list[dict], window: int = 1) -> list[dict]:
     existing_ids = {h["chunk_id"]: h["document"] for h in hits}
     to_fetch = list(neighbor_ids - set(existing_ids.keys()))
 
-    # ── 인접 청크 일괄 조회 ──────────────────────────────────────────────
+    # 인접 청크 일괄 조회
     neighbor_docs: dict[str, str] = {}
     if to_fetch:
         try:
@@ -80,7 +77,7 @@ def expand_chunks(collection, hits: list[dict], window: int = 1) -> list[dict]:
         except Exception as e:
             logger.warning(f"인접 청크 조회 실패 (원본 청크만 사용): {e}")
 
-    # ── 본문 확장 ────────────────────────────────────────────────────────
+    # 본문 확장
     expanded = []
     for hit in hits:
         m = _CHUNK_RE.match(hit["chunk_id"])
@@ -111,7 +108,7 @@ def expand_chunks(collection, hits: list[dict], window: int = 1) -> list[dict]:
     return expanded
 
 
-# ── Hybrid Search ────────────────────────────────────────────────────────────
+# Hybrid Search
 
 def hybrid_search(
     collection,
@@ -121,16 +118,12 @@ def hybrid_search(
     candidates: int = 20,
     expand_window: int = 1,
 ) -> list[dict]:
-    """BM25 + 벡터 검색을 RRF로 융합해 상위 top_n개 청크를 반환한다.
-
-    bm25_index가 None이면 벡터 단독 검색으로 자동 폴백한다.
-    expand_window > 0 이면 인접 청크를 병합해 컨텍스트를 확장한다.
+    """
+    BM25 + 벡터 검색 -> RRF 융합 -> 상위 top_n개 청크를 반환
     반환 dict 키: chunk_id, document, metadata, vec_rank, bm25_rank, rrf_score
     """
 
-    # ── 0. 빈 컬렉션 가드 ───────────────────────────────────────────────────
-    # 인덱싱이 한 번도 안 된 초기 상태에서 ChromaDB query를 호출하면
-    # 내부적으로 거리 계산이 비어 오류가 날 수 있어 미리 분기한다.
+    # 0. 빈 컬렉션 가드
     try:
         coll_size = collection.count()
     except Exception as e:
@@ -141,7 +134,7 @@ def hybrid_search(
         logger.debug("빈 컬렉션 — hybrid_search 즉시 종료")
         return []
 
-    # ── 1. 벡터 검색 ────────────────────────────────────────────────────────
+    # 1. 벡터 검색
     vec_results = collection.query(
         query_texts=[query],
         n_results=min(candidates, coll_size),
@@ -161,7 +154,7 @@ def hybrid_search(
 
     vec_rank_map: dict[str, int] = {cid: r + 1 for r, cid in enumerate(vec_ids)}
 
-    # ── 2. BM25 검색 (폴백 처리 포함) ───────────────────────────────────────
+    # 2. BM25 검색 (폴백 처리 포함)
     bm25_ids: list[str] = []
 
     if bm25_index is not None and bm25_index.chunk_ids:
@@ -187,7 +180,7 @@ def hybrid_search(
 
     bm25_rank_map: dict[str, int] = {cid: r + 1 for r, cid in enumerate(bm25_ids)}
 
-    # ── 3. RRF 융합 ─────────────────────────────────────────────────────────
+    # 3. RRF 융합
     rankings: list[list[str]] = []
     if vec_ids:
         rankings.append(vec_ids)
@@ -203,7 +196,7 @@ def hybrid_search(
     fused_ids = [cid for cid, _ in fused]
     rrf_score_map = dict(fused)
 
-    # ── 4. BM25 전용 청크 본문 보완 ─────────────────────────────────────────
+    # 4. BM25 전용 청크 본문 보완
     # BM25에만 있고 벡터 결과엔 없는 청크는 ChromaDB에서 본문·메타데이터를 가져와야 한다.
     missing = [cid for cid in fused_ids if cid not in vec_docs]
     if missing:
@@ -218,7 +211,7 @@ def hybrid_search(
         except Exception as e:
             logger.warning(f"BM25 전용 청크 본문 조회 실패: {e}")
 
-    # ── 5. 결과 조립 ─────────────────────────────────────────────────────────
+    # 5. 결과 조립
     results: list[dict] = []
     for cid in fused_ids:
         results.append({
@@ -230,7 +223,7 @@ def hybrid_search(
             "rrf_score": rrf_score_map.get(cid, 0.0),
         })
 
-    # ── 6. 인접 청크 확장 ────────────────────────────────────────────────────
+    # 6. 인접 청크 확장
     # expand_window=0 이면 스킵 (기존 동작 유지)
     if expand_window > 0:
         results = expand_chunks(collection, results, window=expand_window)
