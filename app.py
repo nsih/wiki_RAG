@@ -1,7 +1,6 @@
 import streamlit as st
 import chromadb
 import requests
-import json
 import re
 import logging
 import threading
@@ -69,6 +68,7 @@ def load_bm25_index():
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     return bm25_store.load(bm25_path)
 
+
 def call_llm(messages, context):
     url = AI_WORKER_ENDPOINT
 
@@ -78,10 +78,12 @@ def call_llm(messages, context):
         "객관적이고 명확하게 답변하십시오."
     )
 
-    # 이전 대화 내역 포맷팅 (4턴)
+    # 이전 대화 내역 포맷팅
+    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
 
-    # Gemma는 'system' 롤을 지원하지 않음 → 첫 user 메시지에 시스템 프롬프트 인라인 병합
+    # Gemma는 'system' 롤을 지원하지 않음
+    # → 시스템 프롬프트를 첫 번째 user 메시지 앞에 인라인으로 병합
     formatted_messages = []
     for i, msg in enumerate(recent_history):
         content = msg["content"]
@@ -108,10 +110,11 @@ def call_llm(messages, context):
     }
 
     try:
+        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(
             url, json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=150
+            timeout=120
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -119,7 +122,6 @@ def call_llm(messages, context):
             return f"LM Studio 응답 오류: {res.status_code} - {res.text}"
     except Exception as e:
         return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
-
 
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
@@ -137,7 +139,9 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
 
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    #기존 청크를 삭제하고 새 내용으로 재색인
+    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
+    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
+    """
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
@@ -152,7 +156,9 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
 
+
 # 메인 UI
+
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
 try:
@@ -174,16 +180,17 @@ bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
 if os.path.exists(bm25_path):
     mtime = os.path.getmtime(bm25_path)
     base_time = datetime.datetime.fromtimestamp(mtime)
-    
 
     last_patch = st.session_state.get("bm25_last_patch")
     display_time = last_patch if last_patch else base_time
     label = "인덱스 최종 갱신 (메모리)" if last_patch else "인덱스 최종 갱신"
-    
-    st.sidebar.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
 
+    st.sidebar.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
 else:
     st.sidebar.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+
+
+# ── Search AI 모드 ────────────────────────────────────────────────────────────
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
@@ -194,13 +201,18 @@ if app_mode == "Search AI":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("질문하세요."):
+    if prompt := st.chat_input("질문하세요"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            # Hybrid Search (BM25 없으면 벡터 단독 폴백)
-            hits = hybrid_search(collection, bm25_index, prompt, top_n=3, candidates=20)
+            # Hybrid Search + 인접 청크 확장
+            # top_n=2: 청크당 최대 3배 확장 → LLM 입력 토큰 예산 조정
+            # expand_window=1: 앞뒤 각 1청크 병합으로 문맥 보완
+            hits = hybrid_search(
+                collection, bm25_index, prompt,
+                top_n=2, candidates=20, expand_window=1,
+            )
 
             if not hits:
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
@@ -218,13 +230,16 @@ if app_mode == "Search AI":
             st.markdown(ans)
             st.session_state.messages.append({"role": "assistant", "content": ans})
 
+
+# ── PDF → Wiki Data 모드 ──────────────────────────────────────────────────────
+
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
 
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # ── 1단계: form은 데이터 수집과 중복 검사만 ──
+            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
             with st.form("upload_form"):
                 file = st.file_uploader("PDF 선택", type=["pdf"])
                 dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
@@ -246,14 +261,15 @@ elif app_mode == "PDF -> Wiki Data":
 
                         # 중복/유사 검사 결과를 stash. 다음 rerun에서 inline UI 렌더.
                         st.session_state.pending_check = {
-                            'is_exists': is_exists,         
+                            'is_exists': is_exists,
                             'similar': similar,
                             'title': title,
                             'final_path': final_path,
                         }
                         st.rerun()
+
         else:
-            # ── 2단계: inline confirmation UI ──
+            # ── 2단계: inline confirmation UI ───────────────────────────────
             pending = st.session_state.pending_check
             base_config = {
                 'action': 'create',
@@ -263,7 +279,7 @@ elif app_mode == "PDF -> Wiki Data":
             }
 
             if pending['is_exists']:
-                # 동일 경로 존재 — 덮어쓰기 / 취소 둘 중 하나
+                # 동일 경로 존재 — 덮어쓰기 / 취소
                 st.error(f"동일 경로(`{pending['final_path']}`)가 이미 존재합니다.")
                 st.write(f"- **{pending['title']}** ({pending['final_path']})")
                 st.markdown("---")
@@ -318,11 +334,11 @@ elif app_mode == "PDF -> Wiki Data":
                 st.rerun()
 
     else:
+        # ── 3단계: Wiki.js 반영 및 RAG 인덱싱 ──────────────────────────────
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
 
         try:
-            # PyMuPDF 추출 원본을 그대로 사용
             refined_md = st.session_state.raw_text
             with st.expander("📄 추출된 마크다운 미리보기", expanded=False):
                 st.markdown(refined_md)
