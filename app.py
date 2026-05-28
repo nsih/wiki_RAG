@@ -157,6 +157,26 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     return len(chunks)
 
 
+def render_bm25_status(placeholder):
+    """BM25 인덱스 갱신 시각을 플레이스홀더에 렌더링한다.
+
+    플레이스홀더를 인자로 받아 BM25 패치 완료 후 즉시 재호출하면
+    같은 실행 내에서 사이드바가 갱신된다 (st.rerun() 불필요).
+    """
+    bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
+    if os.path.exists(bm25_path):
+        mtime = os.path.getmtime(bm25_path)
+        base_time = datetime.datetime.fromtimestamp(mtime)
+
+        last_patch = st.session_state.get("bm25_last_patch")
+        display_time = last_patch if last_patch else base_time
+        label = "인덱스 최종 갱신 (메모리)" if last_patch else "인덱스 최종 갱신"
+
+        placeholder.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
+    else:
+        placeholder.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+
+
 # 메인 UI
 
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
@@ -175,19 +195,10 @@ app_mode = st.sidebar.radio(
 )
 
 # 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
-bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
-
-if os.path.exists(bm25_path):
-    mtime = os.path.getmtime(bm25_path)
-    base_time = datetime.datetime.fromtimestamp(mtime)
-
-    last_patch = st.session_state.get("bm25_last_patch")
-    display_time = last_patch if last_patch else base_time
-    label = "인덱스 최종 갱신 (메모리)" if last_patch else "인덱스 최종 갱신"
-
-    st.sidebar.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
-else:
-    st.sidebar.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+# empty() 플레이스홀더로 선언해두고, BM25 패치 완료 후 render_bm25_status()를
+# 재호출하면 같은 실행 내에서 값이 즉시 갱신된다.
+bm25_status_placeholder = st.sidebar.empty()
+render_bm25_status(bm25_status_placeholder)
 
 
 # ── Search AI 모드 ────────────────────────────────────────────────────────────
@@ -382,6 +393,9 @@ elif app_mode == "PDF -> Wiki Data":
                     if bm25_index is not None:
                         bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
                         st.session_state["bm25_last_patch"] = datetime.datetime.now()
+                        # 세션에 저장 직후 플레이스홀더를 재렌더링 →
+                        # st.rerun() 없이 같은 실행 내에서 사이드바 즉시 반영
+                        render_bm25_status(bm25_status_placeholder)
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 
