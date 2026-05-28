@@ -35,9 +35,9 @@ def hybrid_search(
     top_n: int = 5,
     candidates: int = 20,
 ) -> list[dict]:
-    """BM25 + 벡터 검색을 RRF로 융합해 상위 top_n개 청크를 반환한다.
+    """BM25 + 벡터 검색을 RRF로 융합해 상위 top_n개 청크 반환
 
-    bm25_index가 None이면 벡터 단독 검색으로 자동 폴백한다.
+    bm25_index가 None이면 벡터 단독 검색으로 자동 폴백
     반환 dict 키: chunk_id, document, metadata, vec_rank, bm25_rank, rrf_score
     """
 
@@ -71,7 +71,7 @@ def hybrid_search(
     for i, cid in enumerate(vec_ids):
         vec_docs[cid] = (vec_results["documents"][0][i] or "")
         vec_metas[cid] = (vec_results["metadatas"][0][i] or {})
-
+        
     vec_rank_map: dict[str, int] = {cid: r + 1 for r, cid in enumerate(vec_ids)}
 
     # ── 2. BM25 검색 (폴백 처리 포함) ───────────────────────────────────────
@@ -108,7 +108,6 @@ def hybrid_search(
         rankings.append(bm25_ids)
 
     if not rankings:
-        # 두 검색기 모두 결과가 없는 극단적 케이스
         logger.debug("벡터/BM25 모두 결과 없음")
         return []
 

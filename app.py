@@ -69,7 +69,6 @@ def load_bm25_index():
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     return bm25_store.load(bm25_path)
 
-
 def call_llm(messages, context):
     url = AI_WORKER_ENDPOINT
 
@@ -79,20 +78,25 @@ def call_llm(messages, context):
         "객관적이고 명확하게 답변하십시오."
     )
 
-    # 이전 대화 내역 포맷팅
-    # [-4:] = user 2턴 + assistant 2턴 = 4턴 유지 (README 명세와 정합)
+    # 이전 대화 내역 포맷팅 (4턴)
     recent_history = messages[:-1][-4:] if len(messages) > 1 else []
-    formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    for msg in recent_history:
-        formatted_messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
+    # Gemma는 'system' 롤을 지원하지 않음 → 첫 user 메시지에 시스템 프롬프트 인라인 병합
+    formatted_messages = []
+    for i, msg in enumerate(recent_history):
+        content = msg["content"]
+        if i == 0 and msg["role"] == "user":
+            content = f"{SYSTEM_PROMPT}\n\n{content}"
+        formatted_messages.append({"role": msg["role"], "content": content})
 
     # 마지막 '현재 질문'에 RAG 검색 컨텍스트 결합
     last_msg = messages[-1]["content"]
     augmented_prompt = f"[참고 문서]\n{context}\n\n[질문]\n{last_msg}"
+
+    # 대화 이력이 없으면(첫 턴) 시스템 프롬프트를 현재 질문에 병합
+    if not formatted_messages:
+        augmented_prompt = f"{SYSTEM_PROMPT}\n\n{augmented_prompt}"
+
     formatted_messages.append({"role": "user", "content": augmented_prompt})
 
     payload = {
@@ -104,11 +108,10 @@ def call_llm(messages, context):
     }
 
     try:
-        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(
             url, json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=120
+            timeout=150
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -116,6 +119,7 @@ def call_llm(messages, context):
             return f"LM Studio 응답 오류: {res.status_code} - {res.text}"
     except Exception as e:
         return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
+
 
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
@@ -133,10 +137,7 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
 
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인합니다.
-    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장합니다.
-    """
-    # 기존 청크 삭제 (없거나 실패해도 진행 가능)
+    #기존 청크를 삭제하고 새 내용으로 재색인
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
@@ -151,9 +152,7 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
 
-
 # 메인 UI
-
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
 try:
@@ -195,7 +194,7 @@ if app_mode == "Search AI":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("질문하세요"):
+    if prompt := st.chat_input("질문하세요."):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
@@ -247,7 +246,7 @@ elif app_mode == "PDF -> Wiki Data":
 
                         # 중복/유사 검사 결과를 stash. 다음 rerun에서 inline UI 렌더.
                         st.session_state.pending_check = {
-                            'is_exists': is_exists,
+                            'is_exists': is_exists,         
                             'similar': similar,
                             'title': title,
                             'final_path': final_path,
@@ -265,7 +264,7 @@ elif app_mode == "PDF -> Wiki Data":
 
             if pending['is_exists']:
                 # 동일 경로 존재 — 덮어쓰기 / 취소 둘 중 하나
-                st.error(f"⚠️ 동일 경로(`{pending['final_path']}`)가 이미 존재합니다.")
+                st.error(f"동일 경로(`{pending['final_path']}`)가 이미 존재합니다.")
                 st.write(f"- **{pending['title']}** ({pending['final_path']})")
                 st.markdown("---")
 
