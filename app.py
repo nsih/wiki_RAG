@@ -74,7 +74,7 @@ def call_llm(messages, context):
 
     SYSTEM_PROMPT = (
         "당신은 RAG 챗봇입니다. "
-        "답변은 반드시 한국어로, 제공되는 참고 문서를 바탕으로 객관적이고 명확하게 답변해주세요. "
+        "답변은 한국어로 제공되는 참고 문서를 바탕으로 객관적이고 명확하게 답변해주세요. "
     )
 
     # 이전 대화 내역 포맷팅
@@ -104,7 +104,7 @@ def call_llm(messages, context):
         "messages": formatted_messages,
         "stream": False,
         "temperature": 0.2,
-        "max_tokens": 1024
+        "max_tokens": 4096
     }
 
     try:
@@ -112,7 +112,7 @@ def call_llm(messages, context):
         res = requests.post(
             url, json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=120
+            timeout=300
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
