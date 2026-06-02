@@ -20,38 +20,34 @@ logger = logging.getLogger(__name__)
 # BM25 in-place 패치 보호용 락 (멀티스레드 동시 업로드 방어)
 _bm25_lock = threading.Lock()
 
+# BM25 메모리 패치 시각을 재시작 후에도 유지하기 위한 사이드카 파일
+# bm25_index.pkl → bm25_index.pkl.patched
+_PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
 
-# 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
+
+# ── 세션 상태 초기화 콜백 (메뉴 전환 시 호출) ────────────────────────────────
 
 def reset_generation_state():
-    """PDF→Wiki 모드의 작업 상태를 모두 정리한다.
-
-    pending_check: form 단계와 confirm 단계 사이의 중간 상태
-    generation_config: confirm 단계에서 결정된 action 포함한 최종 작업 설정
-    """
     for k in ('generation_config', 'raw_text', 'uploaded_file_buffer', 'pending_check'):
         st.session_state.pop(k, None)
 
 
-# 설정 값 (st.secrets에서 로드)
+# ── 설정 값 (st.secrets에서 로드) ─────────────────────────────────────────────
 
-# Directory
 CHROMA_PATH = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
-# Wiki.js API
 WIKI_BASE_URL = st.secrets["WIKI_BASE_URL"]
 WIKI_URL = f"{WIKI_BASE_URL}/graphql"
 WIKI_API_TOKEN = st.secrets["WIKI_API_TOKEN"]
 
-# LM Studio (Search AI 모드 전용)
 AI_WORKER_IP = st.secrets["AI_WORKER_IP"]
 AI_WORKER_PORT = st.secrets.get("AI_WORKER_PORT", 1234)
 AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
-AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "gemma-3n-e4b-it-text")
+AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "")
 
 
-# 헬퍼 함수
+# ── 헬퍼 함수 ────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def load_vectordb():
@@ -64,24 +60,75 @@ def load_vectordb():
 
 @st.cache_resource
 def load_bm25_index():
-    """앱 시작 시 한 번만 로드. 파일 없으면 None 반환 → 벡터 단독 폴백."""
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     return bm25_store.load(bm25_path)
 
 
-def call_llm(messages, context):
-    url = AI_WORKER_ENDPOINT
+def _save_patch_time() -> None:
+    try:
+        with open(_PATCH_TIME_FILE, "w") as f:
+            f.write(datetime.datetime.now().isoformat())
+    except Exception as e:
+        logger.warning(f"패치 시각 파일 저장 실패: {e}")
 
+
+def _load_patch_time() -> datetime.datetime | None:
+    try:
+        with open(_PATCH_TIME_FILE) as f:
+            return datetime.datetime.fromisoformat(f.read().strip())
+    except Exception:
+        return None
+
+
+def render_bm25_status(placeholder) -> None:
+    bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
+
+    if not os.path.exists(bm25_path):
+        placeholder.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+        return
+
+    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(bm25_path))
+
+    # 세션 → 사이드카 파일 순으로 패치 시각 확인
+    last_patch = st.session_state.get("bm25_last_patch") or _load_patch_time()
+
+    if last_patch and last_patch > mtime:
+        # 패치가 더 최신 → 메모리 패치 상태
+        placeholder.caption(f"인덱스 최종 갱신 (메모리): {last_patch:%Y-%m-%d %H:%M}")
+    else:
+        # indexer 배치가 더 최신이거나 패치 없음 → pkl mtime 기준
+        placeholder.caption(f"인덱스 최종 갱신: {mtime:%Y-%m-%d %H:%M}")
+
+
+def _get_loaded_model_id() -> str:
+    """LM Studio /v1/models 에서 현재 로드된 모델 ID를 조회한다.
+    실패 시 secrets의 AI_MODEL_NAME 또는 '알 수 없음'을 반환한다.
+    """
+    try:
+        res = requests.get(
+            f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/models",
+            timeout=5
+        )
+        if res.status_code == 200:
+            models = res.json().get("data", [])
+            if models:
+                return models[0].get("id", AI_MODEL_NAME or "알 수 없음")
+    except Exception:
+        pass
+    return AI_MODEL_NAME or "알 수 없음"
+
+
+def call_llm(messages, context):
     SYSTEM_PROMPT = (
+        "/no_think "
         "당신은 RAG 챗봇입니다. "
-        "답변은 한국어로 제공되는 참고 문서를 바탕으로 객관적이고 명확하게 답변해주세요. "
+        "답변은 한국어로 제공되는 참고 문서를 바탕으로 정확하고 명료하게 답변해주세요. "
     )
 
-    # 이전 대화 내역 포맷팅
+    # 이전 대화 내역 포맷팅 (최근 5개 메시지)
     recent_history = messages[:-1][-5:] if len(messages) > 1 else []
 
-    # Gemma는 'system' 롤을 지원하지 않음
-    # → 시스템 프롬프트를 첫 번째 user 메시지 앞에 인라인으로 병합
+    # 시스템 프롬프트를 첫 번째 user 메시지 앞에 인라인으로 병합
     formatted_messages = []
     for i, msg in enumerate(recent_history):
         content = msg["content"]
@@ -89,7 +136,7 @@ def call_llm(messages, context):
             content = f"{SYSTEM_PROMPT}\n\n{content}"
         formatted_messages.append({"role": msg["role"], "content": content})
 
-    # 마지막 '현재 질문'에 RAG 검색 컨텍스트 결합
+    # 마지막 현재 질문에 RAG 검색 컨텍스트 결합
     last_msg = messages[-1]["content"]
     augmented_prompt = f"[참고 문서]\n{context}\n\n[질문]\n{last_msg}"
 
@@ -100,19 +147,21 @@ def call_llm(messages, context):
     formatted_messages.append({"role": "user", "content": augmented_prompt})
 
     payload = {
-        "model": AI_MODEL_NAME,
         "messages": formatted_messages,
         "stream": False,
         "temperature": 0.2,
-        "max_tokens": 4096
+        "max_tokens": 4096,
     }
+    # AI_MODEL_NAME이 비어 있으면 LM Studio가 현재 로드된 모델을 사용하도록 필드 생략
+    if AI_MODEL_NAME:
+        payload["model"] = AI_MODEL_NAME
 
     try:
-        # 내장 그래픽 환경에서의 E4B 연산 지연을 고려해 타임아웃 여유
         res = requests.post(
-            url, json=payload,
+            AI_WORKER_ENDPOINT,
+            json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=300
+            timeout=600,
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -123,21 +172,27 @@ def call_llm(messages, context):
 
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
-    results = collection.query(query_texts=[query_title], n_results=3, include=["metadatas", "distances"])
+    results = collection.query(
+        query_texts=[query_title], n_results=3,
+        include=["metadatas", "distances"]
+    )
     similar = []
     seen = set()
     if results['ids'] and results['ids'][0]:
         for i in range(len(results['ids'][0])):
             meta = results['metadatas'][0][i]
             dist = results['distances'][0][i]
-            if dist <= threshold and meta is not None and 'path' in meta and meta['path'] not in seen:
+            if (dist <= threshold and meta is not None
+                    and 'path' in meta and meta['path'] not in seen):
                 similar.append({"title": meta['title'], "path": meta['path'], "distance": dist})
                 seen.add(meta['path'])
     return similar
 
 
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    #기존 청크를 삭제 후 재색인
+    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인한다.
+    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장한다.
+    """
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
@@ -153,24 +208,7 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     return len(chunks)
 
 
-def render_bm25_status(placeholder):
-    #BM25 인덱스 갱신 시각을 플레이스홀더에 렌더링
-
-    bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
-    if os.path.exists(bm25_path):
-        mtime = os.path.getmtime(bm25_path)
-        base_time = datetime.datetime.fromtimestamp(mtime)
-
-        last_patch = st.session_state.get("bm25_last_patch")
-        display_time = last_patch if last_patch else base_time
-        label = "인덱스 최종 갱신 (메모리)" if last_patch else "인덱스 최종 갱신"
-
-        placeholder.caption(f"{label}: {display_time:%Y-%m-%d %H:%M}")
-    else:
-        placeholder.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
-
-
-# 메인 UI
+# ── 메인 UI ──────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
@@ -184,20 +222,28 @@ except Exception as e:
 app_mode = st.sidebar.radio(
     "모드 선택",
     ["Search AI", "PDF -> Wiki Data"],
-    on_change=reset_generation_state
+    on_change=reset_generation_state,
 )
 
-# 사이드바 하단 — BM25 인덱스 최종 갱신 시각 표시
-# empty() 플레이스홀더로 선언, 
-# BM25 패치 완료 후 render_bm25_status() 재호출시 같은 실행 내에서 즉시 갱신
+# 사이드바 — 현재 로드된 모델 표시
+with st.sidebar:
+    try:
+        model_id = _get_loaded_model_id()
+        st.caption(f"🤖 모델: {model_id}")
+    except Exception:
+        pass
+
+# 사이드바 — BM25 인덱스 갱신 시각
+# empty() 플레이스홀더로 선언해 BM25 패치 완료 후 재호출 시 즉시 갱신
 bm25_status_placeholder = st.sidebar.empty()
 render_bm25_status(bm25_status_placeholder)
 
 
-# Search AI 모드
+# ── Search AI 모드 ────────────────────────────────────────────────────────────
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -210,9 +256,6 @@ if app_mode == "Search AI":
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            # Hybrid Search + 인접 청크 확장
-            # top_n=2: 청크당 최대 3배 확장 → LLM 입력 토큰 예산 조정
-            # expand_window=1: 앞뒤 각 1청크 병합으로 문맥 보완
             hits = hybrid_search(
                 collection, bm25_index, prompt,
                 top_n=2, candidates=20, expand_window=1,
@@ -222,7 +265,6 @@ if app_mode == "Search AI":
                 ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
             else:
-                # 빈 document 필터링
                 ctx = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
                 titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
@@ -235,14 +277,15 @@ if app_mode == "Search AI":
             st.session_state.messages.append({"role": "assistant", "content": ans})
 
 
-# PDF → Wiki Data 모드
+# ── PDF → Wiki Data 모드 ──────────────────────────────────────────────────────
+
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
 
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # 1단계: form — 데이터 수집 및 중복 검사
+            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
             with st.form("upload_form"):
                 file = st.file_uploader("PDF 선택", type=["pdf"])
                 dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
@@ -262,7 +305,6 @@ elif app_mode == "PDF -> Wiki Data":
                             )
                             similar = search_similar_titles(collection, title)
 
-                        # 중복/유사 검사 결과를 stash. 다음 rerun에서 inline UI 렌더.
                         st.session_state.pending_check = {
                             'is_exists': is_exists,
                             'similar': similar,
@@ -272,7 +314,7 @@ elif app_mode == "PDF -> Wiki Data":
                         st.rerun()
 
         else:
-            # 2단계: inline confirmation UI
+            # ── 2단계: inline confirmation UI ───────────────────────────────
             pending = st.session_state.pending_check
             base_config = {
                 'action': 'create',
@@ -337,10 +379,10 @@ elif app_mode == "PDF -> Wiki Data":
                 st.rerun()
 
     else:
-        # 3단계: Wiki.js 반영 및 RAG 인덱싱
+        # ── 3단계: Wiki.js 반영 및 RAG 인덱싱 ──────────────────────────────
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
-
+        
         try:
             refined_md = st.session_state.raw_text
             with st.expander("📄 추출된 마크다운 미리보기", expanded=False):
@@ -375,7 +417,6 @@ elif app_mode == "PDF -> Wiki Data":
                 new_chunk_ids = [f"page_{page_id}_chunk_{i}" for i in range(cnt)]
                 with _bm25_lock:
                     if config['action'] == 'update':
-                        # 기존 청크 제거 후 신규 청크 추가
                         old_chunk_ids = [
                             cid for cid in bm25_index.chunk_ids
                             if cid.startswith(f"page_{page_id}_chunk_")
@@ -385,9 +426,8 @@ elif app_mode == "PDF -> Wiki Data":
                     if bm25_index is not None:
                         bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
                         st.session_state["bm25_last_patch"] = datetime.datetime.now()
-                        # 세션에 저장 직후 플레이스홀더를 재렌더링 →
-                        # st.rerun() 없이 같은 실행 내에서 사이드바 즉시 반영
-                        render_bm25_status(bm25_status_placeholder)
+                        _save_patch_time()                      # ← 재시작 후에도 복원
+                        render_bm25_status(bm25_status_placeholder)  # ← 사이드바 즉시 갱신
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 

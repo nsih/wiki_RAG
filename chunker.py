@@ -4,8 +4,8 @@ indexer.py와 app.py가 동일한 청킹 로직을 공유하도록 분리한 모
 """
 
 
-def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> list:
-    """슬라이딩 윈도우로 텍스트를 분할한다.
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> list:
+    """슬라이딩 윈도우로 텍스트를 분할
 
     Args:
         text: 분할 대상 텍스트
