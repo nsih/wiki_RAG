@@ -88,22 +88,18 @@ def render_bm25_status(placeholder) -> None:
         return
 
     mtime = datetime.datetime.fromtimestamp(os.path.getmtime(bm25_path))
-
+    
     # 세션 → 사이드카 파일 순으로 패치 시각 확인
     last_patch = st.session_state.get("bm25_last_patch") or _load_patch_time()
 
     if last_patch and last_patch > mtime:
         # 패치가 더 최신 → 메모리 패치 상태
-        placeholder.caption(f"인덱스 최종 갱신 (메모리): {last_patch:%Y-%m-%d %H:%M}")
+        placeholder.caption(f"DB인덱스 최종 갱신 (메모리): {last_patch:%Y-%m-%d %H:%M}")
     else:
         # indexer 배치가 더 최신이거나 패치 없음 → pkl mtime 기준
-        placeholder.caption(f"인덱스 최종 갱신: {mtime:%Y-%m-%d %H:%M}")
-
+        placeholder.caption(f"DB인덱스 최종 갱신: {mtime:%Y-%m-%d %H:%M}")
 
 def _get_loaded_model_id() -> str:
-    """LM Studio /v1/models 에서 현재 로드된 모델 ID를 조회한다.
-    실패 시 secrets의 AI_MODEL_NAME 또는 '알 수 없음'을 반환한다.
-    """
     try:
         res = requests.get(
             f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/models",
@@ -112,7 +108,7 @@ def _get_loaded_model_id() -> str:
         if res.status_code == 200:
             models = res.json().get("data", [])
             if models:
-                return models[0].get("id", AI_MODEL_NAME or "알 수 없음")
+                return models[0].get("id", AI_MODEL_NAME or "Unknown")
     except Exception:
         pass
     return AI_MODEL_NAME or "알 수 없음"
@@ -146,7 +142,7 @@ def call_llm(messages, context):
 
     formatted_messages.append({"role": "user", "content": augmented_prompt})
 
-    payload = {
+    payload = { 
         "messages": formatted_messages,
         "stream": False,
         "temperature": 0.2,
@@ -155,6 +151,8 @@ def call_llm(messages, context):
     # AI_MODEL_NAME이 비어 있으면 LM Studio가 현재 로드된 모델을 사용하도록 필드 생략
     if AI_MODEL_NAME:
         payload["model"] = AI_MODEL_NAME
+
+    
 
     try:
         res = requests.post(
@@ -185,18 +183,18 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
             if (dist <= threshold and meta is not None
                     and 'path' in meta and meta['path'] not in seen):
                 similar.append({"title": meta['title'], "path": meta['path'], "distance": dist})
-                seen.add(meta['path'])
+                seen.add(meta['path'])                
     return similar
 
 
+
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    """페이지의 기존 청크를 삭제하고 새 내용으로 재색인한다.
-    indexer.py와 동일한 chunker.chunk_text를 사용해 청크 일관성을 보장한다.
-    """
+    #페이지의 기존 청크를 삭제하고 재색인
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
         logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}")
+        
 
     chunks = chunk_text(content)
     if not chunks:
@@ -206,9 +204,10 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     metas = [{"page_id": page_id, "title": title, "path": path} for _ in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
+    
+    
 
-
-# ── 메인 UI ──────────────────────────────────────────────────────────────────
+# ── 메인 UI ────────────────────────────────────────────────────────────────── 
 
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
@@ -225,21 +224,22 @@ app_mode = st.sidebar.radio(
     on_change=reset_generation_state,
 )
 
-# 사이드바 — 현재 로드된 모델 표시
+# 
+
+# 로드된 모델 표시
 with st.sidebar:
     try:
         model_id = _get_loaded_model_id()
-        st.caption(f"🤖 모델: {model_id}")
+        st.caption(f"모델: {model_id}")
     except Exception:
         pass
 
 # 사이드바 — BM25 인덱스 갱신 시각
-# empty() 플레이스홀더로 선언해 BM25 패치 완료 후 재호출 시 즉시 갱신
 bm25_status_placeholder = st.sidebar.empty()
 render_bm25_status(bm25_status_placeholder)
 
 
-# ── Search AI 모드 ────────────────────────────────────────────────────────────
+# ── Search AI 모드 ──
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
@@ -254,11 +254,11 @@ if app_mode == "Search AI":
     if prompt := st.chat_input("질문하세요"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
-
+        #         
         with st.chat_message("assistant"):
             hits = hybrid_search(
                 collection, bm25_index, prompt,
-                top_n=2, candidates=20, expand_window=1,
+                top_n=3, candidates=20, expand_window=1,
             )
 
             if not hits:
@@ -285,10 +285,10 @@ elif app_mode == "PDF -> Wiki Data":
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
+            # 1단계: form — 데이터 수집 및 중복 검사
             with st.form("upload_form"):
                 file = st.file_uploader("PDF 선택", type=["pdf"])
-                dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처"])
+                dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처", "PlaceHolder"])
                 title = st.text_input("문서 제목")
                 if st.form_submit_button("시작"):
                     if file and title:
@@ -343,7 +343,6 @@ elif app_mode == "PDF -> Wiki Data":
                         st.rerun()
 
             elif pending['similar']:
-                # 유사 문서 발견 — 덮어쓰기 / 신규 생성 / 취소
                 st.warning("⚠️ 유사한 문서가 발견되었습니다.")
                 for doc in pending['similar']:
                     st.write(
@@ -354,8 +353,7 @@ elif app_mode == "PDF -> Wiki Data":
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    if st.button("덮어쓰기 (Update)", type="primary",
-                                 use_container_width=True, key="cf_overwrite_sim"):
+                    if st.button("덮어쓰기 (Update)", type="primary", use_container_width=True, key="cf_overwrite_sim"):
                         base_config['action'] = 'update'
                         base_config['path'] = pending['similar'][0]['path']
                         st.session_state.generation_config = base_config
@@ -385,7 +383,7 @@ elif app_mode == "PDF -> Wiki Data":
         
         try:
             refined_md = st.session_state.raw_text
-            with st.expander("📄 추출된 마크다운 미리보기", expanded=False):
+            with st.expander("📄 추출된 마크다운 표시", expanded=False):
                 st.markdown(refined_md)
             st.success(f"✅ 추출 완료 (길이: {len(refined_md):,}자)")
 
@@ -411,8 +409,7 @@ elif app_mode == "PDF -> Wiki Data":
                 )
                 st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
 
-            # BM25 인덱스 메모리 패치 (디스크 미반영 — 다음 indexer 배치에서 정식 반영)
-            # _bm25_lock으로 보호 — 동시 업로드 시 race condition 방지
+            # BM25 인덱스 메모리 패치
             try:
                 new_chunk_ids = [f"page_{page_id}_chunk_{i}" for i in range(cnt)]
                 with _bm25_lock:
@@ -426,8 +423,8 @@ elif app_mode == "PDF -> Wiki Data":
                     if bm25_index is not None:
                         bm25_store.patch_add(bm25_index, new_chunk_ids, chunk_text(refined_md))
                         st.session_state["bm25_last_patch"] = datetime.datetime.now()
-                        _save_patch_time()                      # ← 재시작 후에도 복원
-                        render_bm25_status(bm25_status_placeholder)  # ← 사이드바 즉시 갱신
+                        _save_patch_time()
+                        render_bm25_status(bm25_status_placeholder)
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
 

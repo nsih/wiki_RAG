@@ -10,7 +10,7 @@ def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> li
     Args:
         text: 분할 대상 텍스트
         chunk_size: 청크당 최대 글자 수 (기본 500)
-        chunk_overlap: 청크 간 중복 글자 수 (기본 50)
+        chunk_overlap: 청크 간 중복 글자 수 (기본 100)
 
     Returns:
         청크 문자열 리스트. 빈 입력에는 빈 리스트.
