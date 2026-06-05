@@ -24,11 +24,8 @@ _bm25_lock = threading.Lock()
 # bm25_index.pkl → bm25_index.pkl.patched
 _PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
 
-# ── 컨텍스트·이력 상한 ────────────────────────────────────────────────────────
-# Qwen3-4B iGPU(16GB) 환경에서 prefill OOM → Channel Error 방지
-# 500자 청크 × 확장 최대 6개 ≒ 3,000자이므로 2,500자로 제한
+# 컨텍스트 상한
 _CTX_MAX_CHARS  = 2_500
-_HIST_MAX_CHARS = 1_500   # 이력 전체 합산 상한
 
 
 # ── 세션 상태 초기화 콜백 (메뉴 전환 시 호출) ────────────────────────────────
@@ -120,46 +117,24 @@ def _get_loaded_model_id() -> str:
 def call_llm(messages, context):
     SYSTEM_PROMPT = (
         "당신은 RAG 챗봇입니다. "
-        "답변은 한국어로 제공되는 참고 문서를 바탕으로 정확하고 명료하게 답변해주세요."
+        "답변은 참고 문서를 바탕으로, 정확하고 명료하고 간결한 문장으로 답변해주세요."
     )
 
-    # ── 컨텍스트 트런케이션 ────────────────────────────────────────────────
     if len(context) > _CTX_MAX_CHARS:
         context = context[:_CTX_MAX_CHARS] + "\n...(이하 생략)"
 
-    # ── 이력 트런케이션 ────────────────────────────────────────────────────
-    # [출처] 블록은 prefill만 키우고 품질 기여 없음 → 제거
-    # 최근 4개 메시지(user 2턴 + assistant 2턴)를 역순으로 누적해 상한 초과 시 중단
-    recent_history    = messages[:-1][-4:] if len(messages) > 1 else []
-    total_hist_chars  = 0
-    trimmed_history   = []
-    for msg in reversed(recent_history):
-        content = re.sub(r'\*\*\[출처\]\*\*.*', '', msg["content"], flags=re.DOTALL).strip()
-        if total_hist_chars + len(content) > _HIST_MAX_CHARS:
-            break
-        trimmed_history.insert(0, {"role": msg["role"], "content": content})
-        total_hist_chars += len(content)
-
-    # ── 메시지 조립 ────────────────────────────────────────────────────────
-    # /no_think 를 매 턴 마지막 user 메시지 맨 앞에 고정
-    # → Qwen3 chat template이 올바르게 인식하는 위치
-    augmented_prompt = (
+    prompt = (
         f"/no_think\n\n"
         f"{SYSTEM_PROMPT}\n\n"
         f"[참고 문서]\n{context}\n\n"
         f"[질문]\n{messages[-1]['content']}"
     )
 
-    formatted_messages = []
-    for msg in trimmed_history:
-        formatted_messages.append({"role": msg["role"], "content": msg["content"]})
-    formatted_messages.append({"role": "user", "content": augmented_prompt})
-
     payload = {
-        "messages":    formatted_messages,
-        "stream":      False,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
         "temperature": 0.1,
-        "max_tokens":  1024,   # 2048 → 1024: 응답 생성 메모리 절약 (안정화 후 조정 가능)
+        "max_tokens": 2048,
     }
     if AI_MODEL_NAME:
         payload["model"] = AI_MODEL_NAME
@@ -169,7 +144,7 @@ def call_llm(messages, context):
             AI_WORKER_ENDPOINT,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=600,
+            timeout=(10,180),
         )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
@@ -177,7 +152,6 @@ def call_llm(messages, context):
             return f"LM Studio 응답 오류: {res.status_code} - {res.text}"
     except Exception as e:
         return f"LM Studio 연산 서버({AI_WORKER_IP}:{AI_WORKER_PORT}) 통신 실패: {e}"
-
 
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     results = collection.query(
@@ -263,15 +237,17 @@ if app_mode == "Search AI":
         with st.chat_message("assistant"):
             hits = hybrid_search(
                 collection, bm25_index, prompt,
-                top_n=3, candidates=20, expand_window=1,
+                top_n=2, candidates=20, expand_window=1,
             )
 
             if not hits:
-                ctx    = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
-                titles = set()
-            else:
-                ctx    = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
-                titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
+                ans = "관련 문서를 찾지 못했습니다. 질문을 더 구체적으로 입력해주세요."
+                st.markdown(ans)
+                st.session_state.messages.append({"role": "assistant", "content": ans})
+                st.stop()
+
+            ctx    = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
+            titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
             ans = call_llm(st.session_state.messages, ctx)
 
