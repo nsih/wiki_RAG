@@ -9,34 +9,25 @@ import datetime
 from chromadb.utils import embedding_functions
 from io import BytesIO
 
-# 코어 모듈 임포트
+# core module
 import wiki_builder
 import bm25_store
 from retriever import hybrid_search
 from chunker import chunk_text
 
 logger = logging.getLogger(__name__)
-
-# BM25 in-place 패치 보호용 락 (멀티스레드 동시 업로드 방어)
 _bm25_lock = threading.Lock()
-
-# BM25 메모리 패치 시각을 재시작 후에도 유지하기 위한 사이드카 파일
-# bm25_index.pkl → bm25_index.pkl.patched
-_PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
-
-# 컨텍스트 상한
 _CTX_MAX_CHARS  = 2_500
 
+# BM25 메모리 패치 시각 사이드카 파일 (bm25_index.pkl → bm25_index.pkl.patched)
+_PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
 
-# ── 세션 상태 초기화 콜백 (메뉴 전환 시 호출) ────────────────────────────────
-
+# 세션 상태 초기화 콜백 (메뉴 전환 시 호출)
 def reset_generation_state():
     for k in ('generation_config', 'raw_text', 'uploaded_file_buffer', 'pending_check'):
         st.session_state.pop(k, None)
 
-
-# ── 설정 값 (st.secrets에서 로드) ─────────────────────────────────────────────
-
+# config (st.secrets에서 로드)
 CHROMA_PATH     = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
@@ -49,9 +40,7 @@ AI_WORKER_PORT     = st.secrets.get("AI_WORKER_PORT", 1234)
 AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
 AI_MODEL_NAME      = st.secrets.get("AI_MODEL_NAME", "")
 
-
-# ── 헬퍼 함수 ────────────────────────────────────────────────────────────────
-
+# help function
 @st.cache_resource
 def load_vectordb():
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -60,12 +49,10 @@ def load_vectordb():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=ef)
 
-
 @st.cache_resource
 def load_bm25_index():
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
     return bm25_store.load(bm25_path)
-
 
 def _save_patch_time() -> None:
     try:
@@ -81,7 +68,6 @@ def _load_patch_time() -> datetime.datetime | None:
             return datetime.datetime.fromisoformat(f.read().strip())
     except Exception:
         return None
-
 
 def render_bm25_status(placeholder) -> None:
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
@@ -188,7 +174,7 @@ def update_vector_db(collection, page_id: int, title: str, path: str, content: s
     return len(chunks)
 
 
-# ── 메인 UI ──────────────────────────────────────────────────────────────────
+# main UI
 
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
@@ -205,7 +191,7 @@ app_mode = st.sidebar.radio(
     on_change=reset_generation_state,
 )
 
-# 로드된 모델 표시
+# Loaded model
 with st.sidebar:
     try:
         model_id = _get_loaded_model_id()
@@ -213,12 +199,12 @@ with st.sidebar:
     except Exception:
         pass
 
-# 사이드바 — BM25 인덱스 갱신 시각
+# side bar
 bm25_status_placeholder = st.sidebar.empty()
 render_bm25_status(bm25_status_placeholder)
 
 
-# ── Search AI 모드 ────────────────────────────────────────────────────────────
+# MODE : Search AI
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
@@ -258,7 +244,7 @@ if app_mode == "Search AI":
             st.session_state.messages.append({"role": "assistant", "content": ans})
 
 
-# ── PDF → Wiki Data 모드 ──────────────────────────────────────────────────────
+# MODE : PDF → Wiki Data
 
 elif app_mode == "PDF -> Wiki Data":
     st.title("📄 PDF -> Wiki Data")
@@ -266,7 +252,7 @@ elif app_mode == "PDF -> Wiki Data":
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
+            # 1단계: form — 데이터 수집 및 중복 검사
             with st.form("upload_form"):
                 file  = st.file_uploader("PDF 선택", type=["pdf"])
                 dept  = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처", "PlaceHolder"])
@@ -295,7 +281,7 @@ elif app_mode == "PDF -> Wiki Data":
                         st.rerun()
 
         else:
-            # ── 2단계: inline confirmation UI ───────────────────────────────
+            # 2단계: inline confirmation UI
             pending     = st.session_state.pending_check
             base_config = {
                 'action':  'create',
@@ -360,7 +346,7 @@ elif app_mode == "PDF -> Wiki Data":
                 st.rerun()
 
     else:
-        # ── 3단계: Wiki.js 반영 및 RAG 인덱싱 ──────────────────────────────
+        # 3단계: Wiki.js 반영 및 RAG 인덱싱
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
 
