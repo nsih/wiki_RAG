@@ -24,6 +24,12 @@ _bm25_lock = threading.Lock()
 # bm25_index.pkl → bm25_index.pkl.patched
 _PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
 
+# ── 컨텍스트·이력 상한 ────────────────────────────────────────────────────────
+# Qwen3-4B iGPU(16GB) 환경에서 prefill OOM → Channel Error 방지
+# 500자 청크 × 확장 최대 6개 ≒ 3,000자이므로 2,500자로 제한
+_CTX_MAX_CHARS  = 2_500
+_HIST_MAX_CHARS = 1_500   # 이력 전체 합산 상한
+
 
 # ── 세션 상태 초기화 콜백 (메뉴 전환 시 호출) ────────────────────────────────
 
@@ -34,17 +40,17 @@ def reset_generation_state():
 
 # ── 설정 값 (st.secrets에서 로드) ─────────────────────────────────────────────
 
-CHROMA_PATH = st.secrets.get("CHROMA_PATH", "./chroma_db")
+CHROMA_PATH     = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
-WIKI_BASE_URL = st.secrets["WIKI_BASE_URL"]
-WIKI_URL = f"{WIKI_BASE_URL}/graphql"
+WIKI_BASE_URL  = st.secrets["WIKI_BASE_URL"]
+WIKI_URL       = f"{WIKI_BASE_URL}/graphql"
 WIKI_API_TOKEN = st.secrets["WIKI_API_TOKEN"]
 
-AI_WORKER_IP = st.secrets["AI_WORKER_IP"]
-AI_WORKER_PORT = st.secrets.get("AI_WORKER_PORT", 1234)
+AI_WORKER_IP       = st.secrets["AI_WORKER_IP"]
+AI_WORKER_PORT     = st.secrets.get("AI_WORKER_PORT", 1234)
 AI_WORKER_ENDPOINT = f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/chat/completions"
-AI_MODEL_NAME = st.secrets.get("AI_MODEL_NAME", "")
+AI_MODEL_NAME      = st.secrets.get("AI_MODEL_NAME", "")
 
 
 # ── 헬퍼 함수 ────────────────────────────────────────────────────────────────
@@ -87,23 +93,20 @@ def render_bm25_status(placeholder) -> None:
         placeholder.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
         return
 
-    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(bm25_path))
-    
-    # 세션 → 사이드카 파일 순으로 패치 시각 확인
+    mtime      = datetime.datetime.fromtimestamp(os.path.getmtime(bm25_path))
     last_patch = st.session_state.get("bm25_last_patch") or _load_patch_time()
 
     if last_patch and last_patch > mtime:
-        # 패치가 더 최신 → 메모리 패치 상태
         placeholder.caption(f"DB인덱스 최종 갱신 (메모리): {last_patch:%Y-%m-%d %H:%M}")
     else:
-        # indexer 배치가 더 최신이거나 패치 없음 → pkl mtime 기준
         placeholder.caption(f"DB인덱스 최종 갱신: {mtime:%Y-%m-%d %H:%M}")
+
 
 def _get_loaded_model_id() -> str:
     try:
         res = requests.get(
             f"http://{AI_WORKER_IP}:{AI_WORKER_PORT}/v1/models",
-            timeout=5
+            timeout=5,
         )
         if res.status_code == 200:
             models = res.json().get("data", [])
@@ -116,43 +119,50 @@ def _get_loaded_model_id() -> str:
 
 def call_llm(messages, context):
     SYSTEM_PROMPT = (
-        "/no_think "
         "당신은 RAG 챗봇입니다. "
-        "답변은 한국어로 제공되는 참고 문서를 바탕으로 정확하고 명료하게 답변해주세요. "
+        "답변은 한국어로 제공되는 참고 문서를 바탕으로 정확하고 명료하게 답변해주세요."
     )
 
-    # 이전 대화 내역 포맷팅 (최근 5개 메시지)
-    recent_history = messages[:-1][-5:] if len(messages) > 1 else []
+    # ── 컨텍스트 트런케이션 ────────────────────────────────────────────────
+    if len(context) > _CTX_MAX_CHARS:
+        context = context[:_CTX_MAX_CHARS] + "\n...(이하 생략)"
 
-    # 시스템 프롬프트를 첫 번째 user 메시지 앞에 인라인으로 병합
+    # ── 이력 트런케이션 ────────────────────────────────────────────────────
+    # [출처] 블록은 prefill만 키우고 품질 기여 없음 → 제거
+    # 최근 4개 메시지(user 2턴 + assistant 2턴)를 역순으로 누적해 상한 초과 시 중단
+    recent_history    = messages[:-1][-4:] if len(messages) > 1 else []
+    total_hist_chars  = 0
+    trimmed_history   = []
+    for msg in reversed(recent_history):
+        content = re.sub(r'\*\*\[출처\]\*\*.*', '', msg["content"], flags=re.DOTALL).strip()
+        if total_hist_chars + len(content) > _HIST_MAX_CHARS:
+            break
+        trimmed_history.insert(0, {"role": msg["role"], "content": content})
+        total_hist_chars += len(content)
+
+    # ── 메시지 조립 ────────────────────────────────────────────────────────
+    # /no_think 를 매 턴 마지막 user 메시지 맨 앞에 고정
+    # → Qwen3 chat template이 올바르게 인식하는 위치
+    augmented_prompt = (
+        f"/no_think\n\n"
+        f"{SYSTEM_PROMPT}\n\n"
+        f"[참고 문서]\n{context}\n\n"
+        f"[질문]\n{messages[-1]['content']}"
+    )
+
     formatted_messages = []
-    for i, msg in enumerate(recent_history):
-        content = msg["content"]
-        if i == 0 and msg["role"] == "user":
-            content = f"{SYSTEM_PROMPT}\n\n{content}"
-        formatted_messages.append({"role": msg["role"], "content": content})
-
-    # 마지막 현재 질문에 RAG 검색 컨텍스트 결합
-    last_msg = messages[-1]["content"]
-    augmented_prompt = f"[참고 문서]\n{context}\n\n[질문]\n{last_msg}"
-
-    # 대화 이력이 없으면(첫 턴) 시스템 프롬프트를 현재 질문에 병합
-    if not formatted_messages:
-        augmented_prompt = f"{SYSTEM_PROMPT}\n\n{augmented_prompt}"
-
+    for msg in trimmed_history:
+        formatted_messages.append({"role": msg["role"], "content": msg["content"]})
     formatted_messages.append({"role": "user", "content": augmented_prompt})
 
-    payload = { 
-        "messages": formatted_messages,
-        "stream": False,
-        "temperature": 0.2,
-        "max_tokens": 4096,
+    payload = {
+        "messages":    formatted_messages,
+        "stream":      False,
+        "temperature": 0.1,
+        "max_tokens":  1024,   # 2048 → 1024: 응답 생성 메모리 절약 (안정화 후 조정 가능)
     }
-    # AI_MODEL_NAME이 비어 있으면 LM Studio가 현재 로드된 모델을 사용하도록 필드 생략
     if AI_MODEL_NAME:
         payload["model"] = AI_MODEL_NAME
-
-    
 
     try:
         res = requests.post(
@@ -172,10 +182,10 @@ def call_llm(messages, context):
 def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
     results = collection.query(
         query_texts=[query_title], n_results=3,
-        include=["metadatas", "distances"]
+        include=["metadatas", "distances"],
     )
     similar = []
-    seen = set()
+    seen    = set()
     if results['ids'] and results['ids'][0]:
         for i in range(len(results['ids'][0])):
             meta = results['metadatas'][0][i]
@@ -183,37 +193,34 @@ def search_similar_titles(collection, query_title: str, threshold: float = 0.2):
             if (dist <= threshold and meta is not None
                     and 'path' in meta and meta['path'] not in seen):
                 similar.append({"title": meta['title'], "path": meta['path'], "distance": dist})
-                seen.add(meta['path'])                
+                seen.add(meta['path'])
     return similar
 
 
-
 def update_vector_db(collection, page_id: int, title: str, path: str, content: str):
-    #페이지의 기존 청크를 삭제하고 재색인
+    """페이지의 기존 청크를 삭제하고 재색인."""
     try:
         collection.delete(where={"page_id": page_id})
     except Exception as e:
         logger.warning(f"기존 청크 삭제 실패 (page_id={page_id}): {e}")
-        
 
     chunks = chunk_text(content)
     if not chunks:
         return 0
 
-    ids = [f"page_{page_id}_chunk_{i}" for i in range(len(chunks))]
+    ids   = [f"page_{page_id}_chunk_{i}" for i in range(len(chunks))]
     metas = [{"page_id": page_id, "title": title, "path": path} for _ in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, metadatas=metas)
     return len(chunks)
-    
-    
 
-# ── 메인 UI ────────────────────────────────────────────────────────────────── 
+
+# ── 메인 UI ──────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="CSU WIKI AI", layout="centered")
 
 try:
-    collection = load_vectordb()
-    bm25_index = load_bm25_index()
+    collection  = load_vectordb()
+    bm25_index  = load_bm25_index()
 except Exception as e:
     st.error(f"DB 로드 실패: {e}")
     st.stop()
@@ -223,8 +230,6 @@ app_mode = st.sidebar.radio(
     ["Search AI", "PDF -> Wiki Data"],
     on_change=reset_generation_state,
 )
-
-# 
 
 # 로드된 모델 표시
 with st.sidebar:
@@ -239,7 +244,7 @@ bm25_status_placeholder = st.sidebar.empty()
 render_bm25_status(bm25_status_placeholder)
 
 
-# ── Search AI 모드 ──
+# ── Search AI 모드 ────────────────────────────────────────────────────────────
 
 if app_mode == "Search AI":
     st.title("🏫 CSU wiki AI")
@@ -254,7 +259,7 @@ if app_mode == "Search AI":
     if prompt := st.chat_input("질문하세요"):
         st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
-        #         
+
         with st.chat_message("assistant"):
             hits = hybrid_search(
                 collection, bm25_index, prompt,
@@ -262,10 +267,10 @@ if app_mode == "Search AI":
             )
 
             if not hits:
-                ctx = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
+                ctx    = "검색된 관련 문서가 없습니다. 이전 대화 문맥을 참고하여 답변하세요."
                 titles = set()
             else:
-                ctx = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
+                ctx    = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
                 titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
 
             ans = call_llm(st.session_state.messages, ctx)
@@ -285,10 +290,10 @@ elif app_mode == "PDF -> Wiki Data":
     if 'generation_config' not in st.session_state:
 
         if 'pending_check' not in st.session_state:
-            # 1단계: form — 데이터 수집 및 중복 검사
+            # ── 1단계: form — 데이터 수집 및 중복 검사 ──────────────────────
             with st.form("upload_form"):
-                file = st.file_uploader("PDF 선택", type=["pdf"])
-                dept = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처", "PlaceHolder"])
+                file  = st.file_uploader("PDF 선택", type=["pdf"])
+                dept  = st.selectbox("부서", ["정보전산원", "교무처", "학생처", "기획처", "PlaceHolder"])
                 title = st.text_input("문서 제목")
                 if st.form_submit_button("시작"):
                     if file and title:
@@ -307,20 +312,20 @@ elif app_mode == "PDF -> Wiki Data":
 
                         st.session_state.pending_check = {
                             'is_exists': is_exists,
-                            'similar': similar,
-                            'title': title,
+                            'similar':   similar,
+                            'title':     title,
                             'final_path': final_path,
                         }
                         st.rerun()
 
         else:
             # ── 2단계: inline confirmation UI ───────────────────────────────
-            pending = st.session_state.pending_check
+            pending     = st.session_state.pending_check
             base_config = {
-                'action': 'create',
-                'path': pending['final_path'],
+                'action':  'create',
+                'path':    pending['final_path'],
                 'page_id': None,
-                'title': pending['title'],
+                'title':   pending['title'],
             }
 
             if pending['is_exists']:
@@ -343,6 +348,7 @@ elif app_mode == "PDF -> Wiki Data":
                         st.rerun()
 
             elif pending['similar']:
+                # 유사 문서 발견 — 덮어쓰기 / 신규 생성 / 취소
                 st.warning("⚠️ 유사한 문서가 발견되었습니다.")
                 for doc in pending['similar']:
                     st.write(
@@ -353,9 +359,10 @@ elif app_mode == "PDF -> Wiki Data":
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    if st.button("덮어쓰기 (Update)", type="primary", use_container_width=True, key="cf_overwrite_sim"):
+                    if st.button("덮어쓰기 (Update)", type="primary",
+                                 use_container_width=True, key="cf_overwrite_sim"):
                         base_config['action'] = 'update'
-                        base_config['path'] = pending['similar'][0]['path']
+                        base_config['path']   = pending['similar'][0]['path']
                         st.session_state.generation_config = base_config
                         st.session_state.pop('pending_check', None)
                         st.rerun()
@@ -380,7 +387,7 @@ elif app_mode == "PDF -> Wiki Data":
         # ── 3단계: Wiki.js 반영 및 RAG 인덱싱 ──────────────────────────────
         config = st.session_state.generation_config
         st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
-        
+
         try:
             refined_md = st.session_state.raw_text
             with st.expander("📄 추출된 마크다운 표시", expanded=False):
@@ -409,7 +416,7 @@ elif app_mode == "PDF -> Wiki Data":
                 )
                 st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
 
-            # BM25 인덱스 메모리 패치
+            # BM25 인덱스 메모리 패치 (디스크 미반영 — 다음 indexer 배치에서 정식 반영)
             try:
                 new_chunk_ids = [f"page_{page_id}_chunk_{i}" for i in range(cnt)]
                 with _bm25_lock:
