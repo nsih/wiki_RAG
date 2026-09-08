@@ -28,4 +28,9 @@ Thumbs.db
 # 테스트 스크립트 (운영 코드 아님)
 RAG_chat.py
 search.py
+
+# 파인튜닝 생성물 (재생성 가능)
+finetune/data/
+models/
+chroma_db_ft/
 GITIGNORE_END
