@@ -73,7 +73,7 @@ def render_bm25_status(placeholder) -> None:
     bm25_path = st.secrets.get("BM25_PATH", "./bm25_index.pkl")
 
     if not os.path.exists(bm25_path):
-        placeholder.caption("⚠️ BM25 인덱스 없음 — 벡터 단독 검색 중")
+        placeholder.caption("BM25 인덱스 없음 — 벡터 단독 검색 중")
         return
 
     mtime      = datetime.datetime.fromtimestamp(os.path.getmtime(bm25_path))
@@ -207,7 +207,7 @@ render_bm25_status(bm25_status_placeholder)
 # MODE : Search AI
 
 if app_mode == "Search AI":
-    st.title("🏫 CSU wiki AI")
+    st.title("CSU wiki AI")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -247,7 +247,7 @@ if app_mode == "Search AI":
 # MODE : PDF → Wiki Data
 
 elif app_mode == "PDF -> Wiki Data":
-    st.title("📄 PDF -> Wiki Data")
+    st.title("PDF -> Wiki Data")
 
     if 'generation_config' not in st.session_state:
 
@@ -348,13 +348,13 @@ elif app_mode == "PDF -> Wiki Data":
     else:
         # 3단계: Wiki.js 반영 및 RAG 인덱싱
         config = st.session_state.generation_config
-        st.info(f"🚀 처리 중 (대상: `{config['path']}`)")
+        st.info(f"처리 중 (대상: `{config['path']}`)")
 
         try:
             refined_md = st.session_state.raw_text
-            with st.expander("📄 추출된 마크다운 표시", expanded=False):
+            with st.expander("추출된 마크다운 표시", expanded=False):
                 st.markdown(refined_md)
-            st.success(f"✅ 추출 완료 (길이: {len(refined_md):,}자)")
+            st.success(f"추출 완료 (길이: {len(refined_md):,}자)")
 
             with st.spinner("Wiki.js 전송 중..."):
                 if config['action'] == 'update':
@@ -370,13 +370,13 @@ elif app_mode == "PDF -> Wiki Data":
                         WIKI_URL, WIKI_API_TOKEN,
                         config['title'], refined_md, config['path']
                     )
-                st.success(f"✅ 위키 반영 완료 (ID: {page_id})")
+                st.success(f"위키 반영 완료 (ID: {page_id})")
 
             with st.spinner("RAG 엔진 동기화 중..."):
                 cnt = update_vector_db(
                     collection, page_id, config['title'], config['path'], refined_md
                 )
-                st.success(f"✅ 인덱싱 완료 ({cnt}개 청크)")
+                st.success(f"인덱싱 완료 ({cnt}개 청크)")
 
             # BM25 인덱스 메모리 패치 (디스크 미반영 — 다음 indexer 배치에서 정식 반영)
             try:
@@ -396,9 +396,7 @@ elif app_mode == "PDF -> Wiki Data":
                         render_bm25_status(bm25_status_placeholder)
             except Exception as e:
                 logger.warning(f"BM25 패치 실패 (다음 indexer 배치에서 복구됨): {e}")
-
             st.button("새로운 작업 시작", on_click=reset_generation_state, type="primary")
-
         except Exception as e:
             st.error(f"오류: {e}")
             st.button("초기화 및 돌아가기", on_click=reset_generation_state)
