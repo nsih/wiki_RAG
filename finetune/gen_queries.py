@@ -74,11 +74,17 @@ def parse_questions(raw: str) -> list[str]:
     raw = _THINK.sub("", raw or "")
     out = []
     for line in raw.splitlines():
-        q = _LEAD.sub("", line.strip()).strip().strip('"').strip()
+        q = _LEAD.sub("", line.strip()).strip().strip('"').strip("*").strip()
         if len(q) < 6 or len(q) > 200:      # 너무 짧거나 긴 줄은 잡소리
             continue
-        if not q.endswith("?") and not q.endswith("까") and not q.endswith("요"):
-            continue                        # 질문 형태가 아닌 줄 제외
+        # 질문 판별: 처음엔 ?/까/요 로 끝나는 줄만 받았는데 너무 좁았다.
+        # "무엇인가", "어떤 기기인지" 같은 정상 질문이 통째로 버려져
+        # 청크 2개가 계속 실패했다(page_33_chunk_623 등).
+        # 한국어 평서문은 대개 '다'로 끝나므로, 그 반대로 판별한다.
+        tail = q.rstrip(" .。!·")          # 마침표를 떼고 어미를 본다
+        if not q.endswith("?") and (tail.endswith("다") or tail.endswith(":")
+                                    or tail.endswith("음") or tail.endswith("함")):
+            continue                        # 평서문·머리말 줄 제외
         if q not in out:
             out.append(q)
     return out[:2]
