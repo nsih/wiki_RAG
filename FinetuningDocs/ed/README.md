@@ -10,6 +10,7 @@
 | 01 | [PyTorch란 무엇인가](./01-pytorch-basics.md) | PyTorch는 그냥 파이썬에 임포트하는 패키지인가? | 2026-09-09 |
 | 02 | [CUDA란 무엇인가](./02-cuda.md) | CUDA란? / 함수를 모아놓은 라이브러리인가? | 2026-09-09 |
 | 03 | [PyTorch와 CUDA의 관계](./03-pytorch-cuda-relation.md) | 파이썬이 CUDA를 돌리는 건가? / 실무자는 Python과 C++ 중 뭘 다루나? | 2026-09-09 |
+| 04 | [옵티마이저 — SGD, Adam, 학습률](./04-optimizer-and-lr.md) | SGD/Adam이 뭔가? / AdamW가 더 빠른가?(실험 결과 반대) / 2e-5는 무슨 수식인가? | 2026-09-10 |
 
 ## 기록 규칙
 
