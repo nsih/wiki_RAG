@@ -86,6 +86,10 @@ def main() -> None:
     ap.add_argument("--max-len", type=int, default=128,
                     help="학습·평가와 같은 값이어야 한다")
     ap.add_argument("--add-chunk", type=int, default=500, help="Chroma 삽입 단위")
+    ap.add_argument("--encoder", choices=["manual", "st"], default="st",
+                    help="st: 앱과 같은 SentenceTransformerEmbeddingFunction 을 컬렉션에 심는다"
+                         " (query_texts 로 검색 가능, app.py/indexer.py 와 호환). "
+                         "manual: 내가 직접 계산한 벡터를 넣는다(평가 코드와 동일하나 앱에서 못 씀)")
     args = ap.parse_args()
 
     # ★ 안전장치 — 원본 디렉터리에 쓰려고 하면 즉시 멈춘다
@@ -98,11 +102,29 @@ def main() -> None:
     print(f"모델   : {args.model}")
     print(f"대상   : {args.out} / 컬렉션 {args.collection}\n")
 
-    tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModel.from_pretrained(args.model).eval()
-    emb = encode([r["text"] for r in rows], tok, model, args.batch_size, args.max_len)
-
     import chromadb
+
+    # ── 인코더 선택 ────────────────────────────────────────────────────────
+    # 앱(app.py:47, indexer.py:39)은 SentenceTransformerEmbeddingFunction 을 쓴다.
+    # 컬렉션에 그 EF를 심어야 앱이 query_texts= 로 검색할 수 있다.
+    # ko-sroberta 계열은 ST가 Transformer + Pooling(mean)으로 감싸므로
+    # 우리가 학습·평가에 쓴 계산과 결과가 일치한다(질의 3개로 확인: 코사인 1.000000).
+    ef = None
+    emb = None
+    if args.encoder == "st":
+        from chromadb.utils import embedding_functions
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=str(args.model))
+        # ★ 문서 인코딩 길이를 학습·평가와 맞춘다. ST 기본값은 512라 그냥 두면
+        #    평가할 때(128)와 다른 벡터가 만들어진다.
+        try:
+            ef.models[str(args.model)].max_seq_length = args.max_len
+        except Exception:
+            pass
+    else:
+        tok = AutoTokenizer.from_pretrained(args.model)
+        model = AutoModel.from_pretrained(args.model).eval()
+        emb = encode([r["text"] for r in rows], tok, model, args.batch_size, args.max_len)
+
     client = chromadb.PersistentClient(path=str(args.out))
     # 다시 돌려도 깨끗한 상태에서 시작하도록 기존 컬렉션은 지운다(새 디렉터리 한정)
     try:
@@ -110,7 +132,8 @@ def main() -> None:
         print("  기존 컬렉션 삭제 후 재생성")
     except Exception:
         pass
-    col = client.create_collection(name=args.collection, metadata={"hnsw:space": "cosine"})
+    col = client.create_collection(name=args.collection, metadata={"hnsw:space": "cosine"},
+                                   **({"embedding_function": ef} if ef else {}))
 
     t0 = time.time()
     for i in range(0, len(rows), args.add_chunk):
@@ -120,7 +143,7 @@ def main() -> None:
             documents=[r["text"] for r in part],
             metadatas=[{"page_id": r["page_id"], "title": r["title"], "path": r["path"]}
                        for r in part],
-            embeddings=emb[i:i + args.add_chunk].tolist(),
+            **({"embeddings": emb[i:i + args.add_chunk].tolist()} if emb is not None else {}),
         )
         print(f"\r  저장 {min(i+args.add_chunk, len(rows))}/{len(rows)}", end="", flush=True)
     print(f"\r  저장 {len(rows)}/{len(rows)} ({time.time()-t0:.0f}초)")
