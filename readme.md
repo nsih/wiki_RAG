@@ -48,7 +48,7 @@ PDF를 위키 페이지로 자동 변환하는 기능도 함께 제공합니다.
       │         └─────────── RRF Fusion ──────────────────┘
       │
       ├─── LM Studio (별도 호스트)
-      │    Gemma 3n E4B  /v1/chat/completions
+      │    Qwen3-4B  /v1/chat/completions
       │
       └─── Wiki.js (GraphQL API)
 ```
@@ -81,9 +81,9 @@ PDF를 위키 페이지로 자동 변환하는 기능도 함께 제공합니다.
 | RAM | 16GB |
 | GPU | 내장 그래픽 (iGPU) |
 | 런타임 | LM Studio |
-| 모델 | Gemma 3n E4B (`gemma-3n-e4b-it-text`) |
+| 모델 | Qwen3-4B (`qwen/qwen3-4b-2507`) |
 | API | OpenAI 호환 `/v1/chat/completions` |
-| 타임아웃 | 120초 (iGPU 연산 지연 고려) |
+| 타임아웃 | 연결 10초 / 응답 180초 (CPU 추론 지연 고려) |
 
 ---
 
@@ -119,7 +119,7 @@ PDF를 위키 페이지로 자동 변환하는 기능도 함께 제공합니다.
 RRF Score = Σ [ 1 / (k + rank_i) ]   (k = 60)
 ```
 
-각 검색기에서 후보 20개씩 추출 → RRF로 재순위 → 상위 5개를 LLM 컨텍스트에 주입합니다.
+각 검색기에서 후보 20개씩 추출 → RRF로 재순위 → **상위 2개**를 고른 뒤, 각 청크의 **앞뒤 1개 청크를 이어붙여**(`expand_window=1`) LLM 컨텍스트에 주입합니다. 즉 LLM이 받는 본문은 최대 6청크 분량이지만 검색 판정은 상위 2개로 이뤄집니다.
 
 ### 한국어 토큰화 (tokenizer.py)
 
@@ -177,7 +177,7 @@ BM25_PATH       = "./bm25_index.pkl"
 
 AI_WORKER_IP    = "192.168.x.x"
 AI_WORKER_PORT  = 1234
-AI_MODEL_NAME   = "gemma-3n-e4b-it-text"
+AI_MODEL_NAME   = "qwen/qwen3-4b-2507"
 ```
 
 ---
@@ -188,7 +188,7 @@ AI_MODEL_NAME   = "gemma-3n-e4b-it-text"
 
 - 사내 위키 기반 한국어 Q&A
 - Hybrid Search (BM25 + 벡터 RRF 융합)
-- 최근 4턴 대화 이력 유지
+- 대화 이력은 화면에 유지되나, LLM 프롬프트에는 **마지막 질문만** 전달 (단일 턴 질의응답)
 - 답변 하단에 출처 문서 표시
 
 ### PDF → Wiki Data 모드
@@ -220,8 +220,9 @@ Wiki.js 페이지 목록 조회
 사용자 질문
   ├─ 벡터 검색 (ChromaDB, candidates=20)
   ├─ BM25 검색 (bm25_index.pkl, candidates=20)
-  └─ RRF 융합 → 상위 5개
-       └─ LLM 컨텍스트 주입 → 답변 생성
+  └─ RRF 융합 → 상위 2개
+       └─ 각 청크 앞뒤 1개 확장 (expand_chunks)
+            └─ LLM 컨텍스트 주입 → 답변 생성
 ```
 
 ---
