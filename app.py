@@ -17,7 +17,7 @@ from chunker import chunk_text
 
 logger = logging.getLogger(__name__)
 _bm25_lock = threading.Lock()
-_CTX_MAX_CHARS  = 2_500
+_CTX_MAX_CHARS  = 5_000
 
 # BM25 메모리 패치 시각 사이드카 파일 (bm25_index.pkl → bm25_index.pkl.patched)
 _PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
@@ -120,7 +120,7 @@ def call_llm(messages, context):
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "temperature": 0.1,
-        "max_tokens": 2048,
+        "max_tokens": 1024,
     }
     if AI_MODEL_NAME:
         payload["model"] = AI_MODEL_NAME
@@ -223,7 +223,7 @@ if app_mode == "Search AI":
         with st.chat_message("assistant"):
             hits = hybrid_search(
                 collection, bm25_index, prompt,
-                top_n=2, candidates=20, expand_window=1,
+                top_n=3, candidates=20, expand_window=1,
             )
 
             if not hits:
