@@ -1,7 +1,7 @@
-# Wiki AI — 사내 위키 RAG 챗봇
+# Wiki RAG Chat bot
 
-사내 Wiki.js 문서로 한국어 Q&A
-PDF, xml -> convert to wiki page
+1. 사내 Wiki 기반의 한국어 질의응답
+2. PDF, xml -> convert to wiki page
 
 # Search
 
