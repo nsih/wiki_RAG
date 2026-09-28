@@ -7,6 +7,7 @@ import threading
 import os
 import datetime
 from io import BytesIO
+from urllib.parse import quote
 
 # core module
 import wiki_builder
@@ -18,6 +19,10 @@ from embedder import make_embedding_function, DEFAULT_MODEL
 logger = logging.getLogger(__name__)
 _bm25_lock = threading.Lock()
 _CTX_MAX_CHARS  = 5_000
+
+# 참고 문서에 답이 없을 때 LLM이 그대로 내야 하는 문구.
+# 이 문구로 답하면 출처를 붙이지 않는다(무관한 문서를 출처로 보이면 오해를 부른다).
+NO_ANSWER = "참고 문서에서 답을 찾을 수 없습니다."
 
 # BM25 메모리 패치 시각 사이드카 파일 (bm25_index.pkl → bm25_index.pkl.patched)
 _PATCH_TIME_FILE = str(st.secrets.get("BM25_PATH", "./bm25_index.pkl")) + ".patched"
@@ -108,9 +113,13 @@ def _get_loaded_model_id() -> str:
 
 
 def call_llm(messages, context):
+    # 검색은 무관한 질문에도 항상 가장 가까운 문서를 돌려준다.
+    # 그래서 "답이 없다"는 판단은 LLM에게 맡긴다.
     SYSTEM_PROMPT = (
         "당신은 RAG 챗봇입니다. "
-        "답변은 참고 문서를 바탕으로, 정확하고 명료하고 간결한 문장으로 답변해주세요."
+        "답변은 참고 문서를 바탕으로, 정확하고 명료하고 간결한 문장으로 답변해주세요. "
+        "참고 문서에 질문의 답이 없으면 추측하거나 지어내지 말고, "
+        f"정확히 \"{NO_ANSWER}\"라고만 답하세요."
     )
 
     if len(context) > _CTX_MAX_CHARS:
@@ -228,11 +237,12 @@ if app_mode == "Search AI":
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            hits = hybrid_search(
-                collection, bm25_index, prompt,
-                top_n=3, candidates=20, expand_window=1,
-                fusion=FUSION, two_stage_pages=TWO_STAGE_PAGES,
-            )
+            with st.spinner("문서 검색 중..."):
+                hits = hybrid_search(
+                    collection, bm25_index, prompt,
+                    top_n=3, candidates=20, expand_window=1,
+                    fusion=FUSION, two_stage_pages=TWO_STAGE_PAGES,
+                )
 
             if not hits:
                 ans = "관련 문서를 찾지 못했습니다. 질문을 더 구체적으로 입력해주세요."
@@ -240,13 +250,23 @@ if app_mode == "Search AI":
                 st.session_state.messages.append({"role": "assistant", "content": ans})
                 st.stop()
 
-            ctx    = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
-            titles = {h["metadata"].get("title", "제목 없음") for h in hits if h["metadata"]}
+            ctx = "\n---\n".join(h["document"] for h in hits if h["document"].strip())
 
-            ans = call_llm(st.session_state.messages, ctx)
+            # 출처: 페이지(path) 단위로 중복 제거, 검색 순위 순서 유지
+            sources: dict[str, str] = {}
+            for h in hits:
+                meta = h["metadata"] or {}
+                if meta.get("path"):
+                    sources.setdefault(meta["path"], (meta.get("title") or "제목 없음").strip())
 
-            if titles:
-                ans += "\n\n**[출처]**\n" + "\n".join([f"- {t}" for t in titles])
+            with st.spinner("답변 생성 중... (최대 3분)"):
+                ans = call_llm(st.session_state.messages, ctx)
+
+            if sources and NO_ANSWER not in ans:
+                ans += "\n\n**[출처]**\n" + "\n".join(
+                    f"- [{t}]({WIKI_BASE_URL}/ko/{quote(path)})"
+                    for path, t in sources.items()
+                )
 
             st.markdown(ans)
             st.session_state.messages.append({"role": "assistant", "content": ans})
