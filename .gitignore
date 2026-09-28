@@ -1,5 +1,6 @@
-# Streamlit secrets
+# Streamlit secrets (백업본에도 토큰이 들어있다)
 .streamlit/secrets.toml
+.streamlit/secrets.toml.*
 
 # 환경변수
 .env

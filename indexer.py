@@ -9,9 +9,9 @@ from pathlib import Path
 import chromadb
 from markdown import markdown
 from bs4 import BeautifulSoup
-from chromadb.utils import embedding_functions
 
 from chunker import chunk_text
+from embedder import make_embedding_function, DEFAULT_MODEL
 
 
 # 설정 로드 (secrets.toml)
@@ -25,6 +25,10 @@ API_TOKEN = _secrets["WIKI_API_TOKEN"]
 CHROMA_PATH = _secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = _secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
+# 임베딩 설정 — app.py와 같은 값을 읽어야 색인과 검색의 벡터 공간이 일치한다
+EMBED_MODEL = _secrets.get("EMBED_MODEL", DEFAULT_MODEL)
+EMBED_MAX_SEQ_LEN = int(_secrets.get("EMBED_MAX_SEQ_LEN", 0))
+
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json"
@@ -35,9 +39,7 @@ headers = {
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="jhgan/ko-sroberta-multitask"
-)
+sentence_transformer_ef = make_embedding_function(EMBED_MODEL, EMBED_MAX_SEQ_LEN)
 
 collection = chroma_client.get_or_create_collection(
     name=COLLECTION_NAME,

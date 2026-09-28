@@ -27,6 +27,64 @@ def _rrf(rankings: list[list[str]], k: int = 60,
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 
+# 2단계 융합 (벡터 → 페이지 좁히기 → BM25 재정렬)
+
+_PAGE_RE = re.compile(r'^page_(\d+)_chunk_\d+$')
+
+
+def _page_id(chunk_id: str) -> int | None:
+    """'page_{p}_chunk_{i}' 에서 페이지 번호를 뽑는다. 형식이 다르면 None."""
+    m = _PAGE_RE.match(chunk_id)
+    return int(m.group(1)) if m else None
+
+
+def _two_stage(vec_ids: list[str], chunk_ids: list[str], bm25_scores,
+               n_pages: int, top_n: int) -> list[tuple[str, float]]:
+    """벡터로 문서(페이지)를 좁히고, 그 안에서 BM25로 청크를 고른다.
+
+    RRF가 두 점수를 한 번에 합산하는 것과 달리, 두 검색기에 **서로 다른 일을
+    순서대로** 시킨다. 측정 결과 둘이 잘하는 층위가 달랐기 때문이다.
+
+        벡터  : 어느 문서인가        (ft-ep2 페이지 R@5 95.0 > BM25 90.0)
+        BM25  : 그 문서의 어느 행인가 (청크 R@5 77.5 > 벡터 55.0)
+
+    RRF 1:1에서는 잘하는 쪽이 못하는 쪽에 끌려 내려간다. 역할을 나누면
+    eval_human R@5 기준 72.5 → 82.5 (FinetuningDocs/PROGRESS.md 9절).
+
+    Args:
+        vec_ids     : 벡터 검색 결과 (순위 순)
+        chunk_ids   : BM25 인덱스의 전체 청크 ID (bm25_scores와 1:1 대응)
+        bm25_scores : 전체 청크에 대한 BM25 점수 배열
+        n_pages     : 벡터가 고를 페이지 수
+        top_n       : 반환할 청크 수
+
+    Returns: (chunk_id, bm25_score) 쌍. 페이지를 못 고르면 빈 리스트.
+    """
+    # 1단계 — 벡터 상위 순서대로 서로 다른 페이지를 n_pages개까지 모은다
+    pages: list[int] = []
+    for cid in vec_ids:
+        p = _page_id(cid)
+        if p is not None and p not in pages:
+            pages.append(p)
+        if len(pages) >= n_pages:
+            break
+
+    if not pages:
+        # 청크 ID가 'page_..._chunk_...' 형식이 아닌 경우 — 호출측이 RRF로 폴백
+        return []
+
+    # 2단계 — 그 페이지들의 모든 청크를 BM25 점수로 재정렬
+    #         점수 0인 청크도 남긴다. 후보가 top_n보다 적어지는 것을 막기 위함이며
+    #         평가 스크립트(finetune/fusion_ab.py)와 동일한 동작이다.
+    page_set = set(pages)
+    cands = [(cid, float(bm25_scores[i]))
+             for i, cid in enumerate(chunk_ids)
+             if _page_id(cid) in page_set]
+
+    cands.sort(key=lambda x: x[1], reverse=True)
+    return cands[:top_n]
+
+
 # 인접 청크 확장
 
 _CHUNK_RE = re.compile(r'^(page_\d+_chunk_)(\d+)$')
@@ -117,10 +175,20 @@ def hybrid_search(
     top_n: int = 5,
     candidates: int = 20,
     expand_window: int = 1,
+    fusion: str = "rrf",
+    two_stage_pages: int = 3,
 ) -> list[dict]:
     """
-    BM25 + 벡터 검색 -> RRF 융합 -> 상위 top_n개 청크를 반환
-    반환 dict 키: chunk_id, document, metadata, vec_rank, bm25_rank, rrf_score
+    BM25 + 벡터 검색 -> 융합 -> 상위 top_n개 청크를 반환
+
+    Args:
+        fusion          : "rrf"       — 두 순위를 1/(60+rank)로 합산 (기존 동작)
+                          "two_stage" — 벡터로 페이지 two_stage_pages개를 고른 뒤
+                                        그 안에서 BM25 점수로 정렬
+        two_stage_pages : fusion="two_stage"일 때 벡터가 고를 페이지 수
+
+    반환 dict 키: chunk_id, document, metadata, vec_rank, bm25_rank,
+                  rrf_score, bm25_score, fusion
     """
 
     # 0. 빈 컬렉션 가드
@@ -156,48 +224,88 @@ def hybrid_search(
 
     # 2. BM25 검색 (폴백 처리 포함)
     bm25_ids: list[str] = []
+    # 전체 청크 점수 — 2단계 융합이 페이지 내부를 재정렬할 때 쓴다.
+    # None이면 BM25를 못 쓴 것이므로 2단계도 불가능하다.
+    bm25_scores = None
 
     if bm25_index is not None and bm25_index.chunk_ids:
         try:
             query_tokens = tokenize_ko(query)
             # 토큰이 모두 필터링되면(예: 한 글자 질의) BM25 호출을 건너뛴다.
             if query_tokens:
-                scores = bm25_index.bm25.get_scores(query_tokens)
+                bm25_scores = bm25_index.bm25.get_scores(query_tokens)
 
                 # 점수 내림차순 정렬 → 상위 candidates개 추출
                 top_indices = sorted(
-                    range(len(scores)), key=lambda i: scores[i], reverse=True
+                    range(len(bm25_scores)),
+                    key=lambda i: bm25_scores[i], reverse=True
                 )[:candidates]
 
                 bm25_ids = [bm25_index.chunk_ids[i] for i in top_indices
-                            if scores[i] > 0]  # 0 이하는 무관 문서 — 제외
+                            if bm25_scores[i] > 0]  # 0 이하는 무관 문서 — 제외
             else:
                 logger.debug("BM25 쿼리 토큰이 비어 — BM25 단계 스킵")
         except Exception as e:
             logger.warning(f"BM25 검색 실패, 벡터 단독으로 폴백: {e}")
+            bm25_scores = None
     else:
         logger.debug("BM25 인덱스 없음 — 벡터 단독 검색")
 
     bm25_rank_map: dict[str, int] = {cid: r + 1 for r, cid in enumerate(bm25_ids)}
 
-    # 3. RRF 융합
-    rankings: list[list[str]] = []
-    if vec_ids:
-        rankings.append(vec_ids)
-    if bm25_ids:
-        rankings.append(bm25_ids)
+    # bm25_scores는 bm25_index.chunk_ids와 같은 순서로 정렬돼 있어야 한다
+    # (bm25_store가 tokens/chunk_ids를 항상 같이 갱신한다). 어긋나면 잘못된 청크에
+    # 점수를 붙이게 되므로, 쓰지 않고 RRF로 내려간다.
+    if bm25_scores is not None and len(bm25_scores) != len(bm25_index.chunk_ids):
+        logger.warning(
+            f"BM25 점수/ID 길이 불일치({len(bm25_scores)} vs "
+            f"{len(bm25_index.chunk_ids)}) — 2단계 융합 비활성화"
+        )
+        bm25_scores = None
 
-    if not rankings:
-        # 두 검색기 모두 결과가 없는 극단적 케이스
-        logger.debug("벡터/BM25 모두 결과 없음")
-        return []
+    bm25_score_map: dict[str, float] = {}
+    if bm25_scores is not None:
+        bm25_score_map = {cid: float(bm25_scores[i])
+                          for i, cid in enumerate(bm25_index.chunk_ids)}
 
-    fused: list[tuple[str, float]] = _rrf(rankings, k=60, top_n=top_n)
-    fused_ids = [cid for cid, _ in fused]
-    rrf_score_map = dict(fused)
+    # 3. 융합
+    used_fusion = "rrf"
+    fused_ids: list[str] = []
+    rrf_score_map: dict[str, float] = {}
 
-    # 4. BM25 전용 청크 본문 보완
-    # BM25에만 있고 벡터 결과엔 없는 청크는 ChromaDB에서 본문·메타데이터를 가져와야 한다.
+    # 3-a. 2단계 — 벡터로 페이지를 좁히고 그 안에서 BM25로 정렬
+    #      벡터 결과와 BM25 점수가 **둘 다** 있어야 성립한다.
+    #      하나라도 없으면 아래 RRF로 조용히 내려간다(= 사실상 단독 검색).
+    if fusion == "two_stage" and vec_ids and bm25_scores is not None:
+        staged = _two_stage(vec_ids, bm25_index.chunk_ids, bm25_scores,
+                            n_pages=two_stage_pages, top_n=top_n)
+        if staged:
+            used_fusion = "two_stage"
+            fused_ids = [cid for cid, _ in staged]
+        else:
+            logger.debug("2단계에서 페이지를 못 골랐다 — RRF로 폴백")
+    elif fusion == "two_stage":
+        logger.debug("2단계 조건 미충족(벡터 또는 BM25 결과 없음) — RRF로 폴백")
+
+    # 3-b. RRF — 기본값이자 2단계의 폴백
+    if not fused_ids:
+        rankings: list[list[str]] = []
+        if vec_ids:
+            rankings.append(vec_ids)
+        if bm25_ids:
+            rankings.append(bm25_ids)
+
+        if not rankings:
+            # 두 검색기 모두 결과가 없는 극단적 케이스
+            logger.debug("벡터/BM25 모두 결과 없음")
+            return []
+
+        fused: list[tuple[str, float]] = _rrf(rankings, k=60, top_n=top_n)
+        fused_ids = [cid for cid, _ in fused]
+        rrf_score_map = dict(fused)
+
+    # 4. 벡터 결과 밖 청크의 본문 보완
+    # BM25(또는 2단계)로만 뽑힌 청크는 ChromaDB에서 본문·메타데이터를 가져와야 한다.
     missing = [cid for cid in fused_ids if cid not in vec_docs]
     if missing:
         try:
@@ -220,7 +328,9 @@ def hybrid_search(
             "metadata":  vec_metas.get(cid, {}),
             "vec_rank":  vec_rank_map.get(cid, -1),   # -1 = 해당 검색기 미포함
             "bm25_rank": bm25_rank_map.get(cid, -1),
-            "rrf_score": rrf_score_map.get(cid, 0.0),
+            "rrf_score": rrf_score_map.get(cid, 0.0),   # 2단계에서는 0.0
+            "bm25_score": bm25_score_map.get(cid, 0.0),
+            "fusion":    used_fusion,
         })
 
     # 6. 인접 청크 확장
@@ -229,7 +339,7 @@ def hybrid_search(
         results = expand_chunks(collection, results, window=expand_window)
 
     logger.debug(
-        f"hybrid_search 완료 — vec={len(vec_ids)} bm25={len(bm25_ids)} "
-        f"fused={len(results)} expand_window={expand_window}"
+        f"hybrid_search 완료 — fusion={used_fusion} vec={len(vec_ids)} "
+        f"bm25={len(bm25_ids)} fused={len(results)} expand_window={expand_window}"
     )
     return results

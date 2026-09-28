@@ -18,6 +18,10 @@ def tokenize_ko(text: str) -> list[str]:
     """한국어/영문/숫자 덩어리를 추출하고 끝조사·단음절 토큰을 제거한다.
 
     형태소 분석기 없이 정규식 + 조사 스트리핑 휴리스틱으로 처리.
+    kiwipiepy/konlpy를 쓰지 않는 것은 정확도 문제가 아니라 **메모리 제약** 때문이다.
+    앱 서버 RAM이 4GB인데 ChromaDB + SentenceTransformer + BM25가 동시에 상주해야 하고,
+    형태소 분석기는 로딩만으로 수백 MB를 더 먹는다. 되살리려면 그 여유부터 확보할 것.
+
     indexer.py와 app.py가 동일 함수를 공유해 BM25 인덱스 일관성을 보장한다.
 
     Args:

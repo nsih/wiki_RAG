@@ -6,7 +6,6 @@ import logging
 import threading
 import os
 import datetime
-from chromadb.utils import embedding_functions
 from io import BytesIO
 
 # core module
@@ -14,6 +13,7 @@ import wiki_builder
 import bm25_store
 from retriever import hybrid_search
 from chunker import chunk_text
+from embedder import make_embedding_function, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 _bm25_lock = threading.Lock()
@@ -31,6 +31,15 @@ def reset_generation_state():
 CHROMA_PATH     = st.secrets.get("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = st.secrets.get("COLLECTION_NAME", "wiki_knowledge")
 
+# 임베딩 — 모델을 바꾸면 CHROMA_PATH도 그 모델로 만든 색인을 가리켜야 한다.
+# 두 값은 항상 같이 움직인다 (finetune/reindex.py로 색인 생성).
+EMBED_MODEL       = st.secrets.get("EMBED_MODEL", DEFAULT_MODEL)
+EMBED_MAX_SEQ_LEN = int(st.secrets.get("EMBED_MAX_SEQ_LEN", 0))
+
+# 융합 방식 — "rrf"(기존) 또는 "two_stage"(벡터로 페이지 선별 → BM25로 정렬)
+FUSION          = st.secrets.get("FUSION", "rrf")
+TWO_STAGE_PAGES = int(st.secrets.get("TWO_STAGE_PAGES", 3))
+
 WIKI_BASE_URL  = st.secrets["WIKI_BASE_URL"]
 WIKI_URL       = f"{WIKI_BASE_URL}/graphql"
 WIKI_API_TOKEN = st.secrets["WIKI_API_TOKEN"]
@@ -43,9 +52,7 @@ AI_MODEL_NAME      = st.secrets.get("AI_MODEL_NAME", "")
 # help function
 @st.cache_resource
 def load_vectordb():
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="jhgan/ko-sroberta-multitask"
-    )
+    ef = make_embedding_function(EMBED_MODEL, EMBED_MAX_SEQ_LEN)
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=ef)
 
@@ -108,7 +115,7 @@ def call_llm(messages, context):
 
     if len(context) > _CTX_MAX_CHARS:
         context = context[:_CTX_MAX_CHARS] + "\n...(이하 생략)"
-
+        
     prompt = (
         f"/no_think\n\n"
         f"{SYSTEM_PROMPT}\n\n"
@@ -224,6 +231,7 @@ if app_mode == "Search AI":
             hits = hybrid_search(
                 collection, bm25_index, prompt,
                 top_n=3, candidates=20, expand_window=1,
+                fusion=FUSION, two_stage_pages=TWO_STAGE_PAGES,
             )
 
             if not hits:
