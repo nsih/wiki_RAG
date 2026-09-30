@@ -260,6 +260,7 @@ if app_mode == "Search AI":
                     sources.setdefault(meta["path"], (meta.get("title") or "제목 없음").strip())
 
             with st.spinner("답변 생성 중... (최대 3분)"):
+
                 ans = call_llm(st.session_state.messages, ctx)
 
             if sources and NO_ANSWER not in ans:
@@ -323,7 +324,7 @@ elif app_mode == "PDF -> Wiki Data":
                 st.error(f"동일 경로(`{pending['final_path']}`)가 이미 존재합니다.")
                 st.write(f"- **{pending['title']}** ({pending['final_path']})")
                 st.markdown("---")
-
+                
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("덮어쓰기 (Update)", type="primary",
@@ -346,10 +347,10 @@ elif app_mode == "PDF -> Wiki Data":
                         f"유사도: {max(0, 1 - doc['distance']):.1%}"
                     )
                 st.markdown("---")
-
+    
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    if st.button("덮어쓰기 (Update)", type="primary",
+                    if st.button("덮어쓰기 (Update)", type="primary",   
                                  use_container_width=True, key="cf_overwrite_sim"):
                         base_config['action'] = 'update'
                         base_config['path']   = pending['similar'][0]['path']
